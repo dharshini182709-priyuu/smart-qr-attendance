@@ -669,12 +669,12 @@ def scan():
 
                         </div>
 
-                        <a
-                            class="button"
-                            href="/scan"
-                        >
-                            📱 Mark Another Student
-                        </a>
+                       <a
+                       class="button"
+                       href="/"
+                       >
+                       🏠 Back to Home
+                       </a>
 
                     </div>
 
