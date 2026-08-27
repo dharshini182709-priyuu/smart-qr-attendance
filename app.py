@@ -4,14 +4,13 @@ import secrets
 import math
 from datetime import datetime
 
-from flask import Flask, render_template_string, request
-
+from flask import Flask, render_template, render_template_string, request, redirect, url_for, session
 COLLEGE_LAT = 11.0679090
 COLLEGE_LON = 77.0833440
 ALLOWED_RADIUS = 100
 
 app = Flask(__name__)
-
+app.secret_key = "smartqr-secret-key"
 
 def is_inside_college(latitude, longitude):
 
@@ -43,7 +42,6 @@ def is_inside_college(latitude, longitude):
 # SECURITY
 # --------------------------------
 
-app.secret_key = secrets.token_hex(32)
 
 # This is the secret QR access token.
 # The QR code must open this URL:
@@ -209,6 +207,16 @@ def qr_required():
 # --------------------------------
 
 @app.route("/")
+def get_students():
+    conn = connect_db()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT student_id, name FROM students ORDER BY student_id")
+    students = cursor.fetchall()
+
+    conn.close()
+
+    return students
 def home():
 
     students = get_students()
@@ -1564,7 +1572,20 @@ def attendance():
             """
         )
 
+def get_attendance():
+    conn = connect_db()
+    cursor = conn.cursor()
 
+    cursor.execute("""
+        SELECT student_id, name, date, time
+        FROM attendance
+        ORDER BY date DESC, time DESC
+    """)
+
+    records = cursor.fetchall()
+    conn.close()
+
+    return records
     records = get_attendance()
 
 
