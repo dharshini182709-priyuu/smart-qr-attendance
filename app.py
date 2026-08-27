@@ -1,18 +1,43 @@
 import csv
 import sqlite3
 import secrets
-
+import math
 from datetime import datetime
-from flask import Flask, render_template_string, request, session, redirect
 
-from database import (
-    create_tables,
-    get_students,
-    get_attendance
-)
+from flask import Flask, render_template_string, request
 
+COLLEGE_LAT = 11.0679090
+COLLEGE_LON = 77.0833440
+ALLOWED_RADIUS = 100
 
 app = Flask(__name__)
+
+
+def is_inside_college(latitude, longitude):
+
+    R = 6371000
+
+    lat1 = math.radians(COLLEGE_LAT)
+    lat2 = math.radians(latitude)
+
+    dlat = math.radians(latitude - COLLEGE_LAT)
+    dlon = math.radians(longitude - COLLEGE_LON)
+
+    a = (
+        math.sin(dlat / 2) ** 2
+        + math.cos(lat1)
+        * math.cos(lat2)
+        * math.sin(dlon / 2) ** 2
+    )
+
+    c = 2 * math.atan2(
+        math.sqrt(a),
+        math.sqrt(1 - a)
+    )
+
+    distance = R * c
+
+    return distance <= ALLOWED_RADIUS
 
 # --------------------------------
 # SECURITY
@@ -38,6 +63,37 @@ CSV_FILE = "students.csv"
 
 def connect_db():
     return sqlite3.connect(DB_NAME)
+
+
+# --------------------------------
+# CREATE TABLES
+# --------------------------------
+def create_tables():
+    conn = connect_db()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS students (
+            student_id TEXT PRIMARY KEY,
+            name TEXT
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS attendance (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_id TEXT,
+            date TEXT,
+            time TEXT
+        )
+        """
+    )
+
+    conn.commit()
+    conn.close()
 
 
 # --------------------------------
@@ -669,12 +725,12 @@ def scan():
 
                         </div>
 
-                       <a
-                       class="button"
-                       href="/"
-                       >
-                       🏠 Back to Home
-                       </a>
+                        <a
+                            class="button"
+                            href="/scan"
+                        >
+                            📱 Mark Another Student
+                        </a>
 
                     </div>
 
