@@ -20,7 +20,7 @@ COLLEGE_LAT = 11.0679090
 COLLEGE_LON = 77.0833440
 
 # Allowed radius in metres
-ALLOWED_RADIUS = 600
+ALLOWED_RADIUS = 500
 
 
 # ============================================================
