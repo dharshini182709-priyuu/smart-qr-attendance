@@ -1,18 +1,73 @@
 import csv
 import sqlite3
-import secrets
 import math
 from datetime import datetime
 
-from flask import Flask, render_template, render_template_string, request, redirect, url_for, session
+from flask import (
+    Flask,
+    render_template_string,
+    request,
+    redirect,
+    session,
+    jsonify
+)
+
+# ============================================================
+# COLLEGE LOCATION SETTINGS
+# ============================================================
+
 COLLEGE_LAT = 11.0679090
 COLLEGE_LON = 77.0833440
+
+# Allowed radius in metres
 ALLOWED_RADIUS = 100
 
+
+# ============================================================
+# FLASK APP
+# ============================================================
+
 app = Flask(__name__)
-app.secret_key = "smartqr-secret-key"
+
+# Secret key for session
+app.secret_key = "smartqr-secret-key-2026"
+
+
+# ============================================================
+# QR TOKEN
+# ============================================================
+
+QR_TOKEN = "SMARTQR2026"
+
+
+# ============================================================
+# DATABASE / CSV
+# ============================================================
+
+DB_NAME = "attendance.db"
+CSV_FILE = "students.csv"
+
+
+# ============================================================
+# DATABASE CONNECTION
+# ============================================================
+
+def connect_db():
+    conn = sqlite3.connect(DB_NAME)
+    return conn
+
+
+# ============================================================
+# CHECK LOCATION
+# ============================================================
 
 def is_inside_college(latitude, longitude):
+
+    try:
+        latitude = float(latitude)
+        longitude = float(longitude)
+    except (TypeError, ValueError):
+        return False
 
     R = 6371000
 
@@ -38,65 +93,39 @@ def is_inside_college(latitude, longitude):
 
     return distance <= ALLOWED_RADIUS
 
-# --------------------------------
-# SECURITY
-# --------------------------------
 
+# ============================================================
+# CREATE DATABASE TABLES
+# ============================================================
 
-# This is the secret QR access token.
-# The QR code must open this URL:
-#
-# http://YOUR-IP:5000/access/SMARTQR2026
-#
-QR_TOKEN = "SMARTQR2026"
-
-
-DB_NAME = "attendance.db"
-CSV_FILE = "students.csv"
-
-
-# --------------------------------
-# DATABASE CONNECTION
-# --------------------------------
-
-def connect_db():
-    return sqlite3.connect(DB_NAME)
-
-
-# --------------------------------
-# CREATE TABLES
-# --------------------------------
 def create_tables():
+
     conn = connect_db()
     cursor = conn.cursor()
 
-    cursor.execute(
-        """
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS students (
             student_id TEXT PRIMARY KEY,
-            name TEXT
+            name TEXT NOT NULL
         )
-        """
-    )
+    """)
 
-    cursor.execute(
-        """
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS attendance (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            student_id TEXT,
-            date TEXT,
-            time TEXT
+            student_id TEXT NOT NULL,
+            date TEXT NOT NULL,
+            time TEXT NOT NULL
         )
-        """
-    )
+    """)
 
     conn.commit()
     conn.close()
 
 
-# --------------------------------
+# ============================================================
 # IMPORT STUDENTS FROM CSV
-# --------------------------------
+# ============================================================
 
 def import_students():
 
@@ -123,11 +152,11 @@ def import_students():
             for row in reader:
 
                 student_id = str(
-                    row["student_id"]
+                    row.get("student_id", "")
                 ).strip()
 
                 name = str(
-                    row["name"]
+                    row.get("name", "")
                 ).strip()
 
                 if student_id and name:
@@ -152,74 +181,401 @@ def import_students():
 
     except Exception as e:
 
-        print("ERROR:", e)
+        print(
+            "CSV IMPORT ERROR:",
+            e
+        )
 
 
-# --------------------------------
-# QR ACCESS ROUTE
-# --------------------------------
+# ============================================================
+# QR ACCESS PAGE
+# ============================================================
 
 @app.route("/access/<token>")
 def qr_access(token):
 
+    # --------------------------------------------------------
+    # CHECK QR TOKEN
+    # --------------------------------------------------------
+
     if token != QR_TOKEN:
 
-        return """
+        return render_template_string("""
+            <!DOCTYPE html>
+
+            <html>
+
+            <head>
+
+                <title>Invalid QR</title>
+
+                <style>
+
+                    body {
+                        font-family: Arial;
+                        background: #f4f6f8;
+                        text-align: center;
+                        padding: 80px 20px;
+                    }
+
+                    .box {
+                        max-width: 500px;
+                        margin: auto;
+                        background: white;
+                        padding: 35px;
+                        border-radius: 15px;
+                    }
+
+                    h1 {
+                        color: red;
+                    }
+
+                </style>
+
+            </head>
+
+            <body>
+
+                <div class="box">
+
+                    <h1>
+                        ❌ Invalid QR Code
+                    </h1>
+
+                    <p>
+                        This QR code is not valid.
+                    </p>
+
+                </div>
+
+            </body>
+
+            </html>
+        """)
+
+
+    # --------------------------------------------------------
+    # LOCATION VERIFICATION PAGE
+    # --------------------------------------------------------
+
+    return render_template_string("""
+        <!DOCTYPE html>
+
         <html>
-        <body style="
-            font-family:Arial;
-            text-align:center;
-            margin-top:100px;
-        ">
 
-        <h1 style="color:red;">
-            ❌ Invalid QR Code
-        </h1>
+        <head>
 
-        <p>
-            This QR code is not valid.
-        </p>
+            <meta name="viewport"
+                  content="width=device-width, initial-scale=1">
+
+            <title>Verifying Attendance</title>
+
+            <style>
+
+                body {
+                    font-family: Arial;
+                    background: #f4f6f8;
+                    text-align: center;
+                    padding: 60px 20px;
+                }
+
+                .box {
+                    max-width: 500px;
+                    margin: auto;
+                    background: white;
+                    padding: 35px;
+                    border-radius: 15px;
+                    box-shadow: 0 5px 20px rgba(0,0,0,0.08);
+                }
+
+                h1 {
+                    color: #222;
+                }
+
+                .loading {
+                    font-size: 45px;
+                    margin: 20px;
+                }
+
+                button {
+                    padding: 14px 25px;
+                    background: #222;
+                    color: white;
+                    border: none;
+                    border-radius: 8px;
+                    font-size: 17px;
+                }
+
+                #message {
+                    margin-top: 20px;
+                    font-size: 16px;
+                }
+
+            </style>
+
+        </head>
+
+        <body>
+
+            <div class="box">
+
+                <div class="loading">
+                    📍
+                </div>
+
+                <h1>
+                    Verifying Location
+                </h1>
+
+                <p>
+                    Please allow location access.
+                </p>
+
+                <p>
+                    Attendance can be opened only
+                    from inside the college.
+                </p>
+
+                <div id="message">
+                    Checking your location...
+                </div>
+
+            </div>
+
+
+            <script>
+
+                function showMessage(message, color) {
+
+                    const box =
+                        document.getElementById("message");
+
+                    box.innerHTML = message;
+
+                    box.style.color = color;
+                }
+
+
+                function verifyLocation() {
+
+                    if (!navigator.geolocation) {
+
+                        showMessage(
+                            "❌ Location is not supported by this browser.",
+                            "red"
+                        );
+
+                        return;
+                    }
+
+
+                    navigator.geolocation.getCurrentPosition(
+
+                        function(position) {
+
+                            const latitude =
+                                position.coords.latitude;
+
+                            const longitude =
+                                position.coords.longitude;
+
+
+                            fetch("/verify-location", {
+
+                                method: "POST",
+
+                                headers: {
+                                    "Content-Type":
+                                        "application/json"
+                                },
+
+                                body: JSON.stringify({
+                                    latitude: latitude,
+                                    longitude: longitude
+                                })
+
+                            })
+
+                            .then(response =>
+                                response.json()
+                            )
+
+                            .then(data => {
+
+                                if (data.success) {
+
+                                    showMessage(
+                                        "✅ Location verified. Opening attendance...",
+                                        "green"
+                                    );
+
+                                    setTimeout(
+                                        function() {
+                                            window.location.href =
+                                                "/scan";
+                                        },
+                                        800
+                                    );
+
+                                } else {
+
+                                    showMessage(
+                                        "❌ " + data.message,
+                                        "red"
+                                    );
+
+                                }
+
+                            })
+
+                            .catch(error => {
+
+                                showMessage(
+                                    "❌ Unable to verify location.",
+                                    "red"
+                                );
+
+                            });
+
+                        },
+
+                        function(error) {
+
+                            showMessage(
+                                "❌ Please allow location permission to continue.",
+                                "red"
+                            );
+
+                        },
+
+                        {
+                            enableHighAccuracy: true,
+                            timeout: 15000,
+                            maximumAge: 0
+                        }
+
+                    );
+
+                }
+
+
+                verifyLocation();
+
+            </script>
 
         </body>
+
         </html>
-        """
-
-    # QR successfully scanned
-    session["qr_verified"] = True
-
-    return redirect("/scan")
+    """)
 
 
-# --------------------------------
+# ============================================================
+# VERIFY LOCATION
+# ============================================================
+
+@app.route(
+    "/verify-location",
+    methods=["POST"]
+)
+def verify_location():
+
+    try:
+
+        data = request.get_json()
+
+        latitude = data.get("latitude")
+        longitude = data.get("longitude")
+
+        if latitude is None or longitude is None:
+
+            return jsonify({
+                "success": False,
+                "message": "Location data not available."
+            })
+
+
+        inside = is_inside_college(
+            latitude,
+            longitude
+        )
+
+
+        if inside:
+
+            # Location verified
+            session["location_verified"] = True
+            session["qr_verified"] = True
+
+            return jsonify({
+                "success": True,
+                "message": "Inside college"
+            })
+
+
+        # Outside college
+        session.pop(
+            "location_verified",
+            None
+        )
+
+        session.pop(
+            "qr_verified",
+            None
+        )
+
+        return jsonify({
+            "success": False,
+            "message":
+                "You must be inside the college to access attendance."
+        })
+
+
+    except Exception as e:
+
+        print(
+            "LOCATION ERROR:",
+            e
+        )
+
+        return jsonify({
+            "success": False,
+            "message": "Location verification failed."
+        })
+
+
+# ============================================================
 # SECURITY CHECK
-# --------------------------------
+# ============================================================
 
 def qr_required():
 
-    return session.get(
-        "qr_verified",
-        False
+    return (
+        session.get("qr_verified", False)
+        and
+        session.get("location_verified", False)
     )
 
 
-# --------------------------------
+# ============================================================
 # HOME PAGE
-# --------------------------------
+# ============================================================
 
 @app.route("/")
-def get_students():
+def home():
+
     conn = connect_db()
     cursor = conn.cursor()
 
-    cursor.execute("SELECT student_id, name FROM students ORDER BY student_id")
+    cursor.execute("""
+        SELECT student_id, name
+        FROM students
+        ORDER BY student_id
+    """)
+
     students = cursor.fetchall()
 
     conn.close()
 
-    return students
-def home():
-
-    students = get_students()
 
     html = """
     <!DOCTYPE html>
@@ -228,6 +584,9 @@ def home():
 
     <head>
 
+        <meta name="viewport"
+              content="width=device-width, initial-scale=1">
+
         <title>Smart QR Attendance</title>
 
         <style>
@@ -235,7 +594,8 @@ def home():
             body {
                 font-family: Arial;
                 background: #f4f6f8;
-                margin: 40px;
+                margin: 0;
+                padding: 30px;
             }
 
             h1 {
@@ -266,10 +626,6 @@ def home():
                 font-size: 16px;
             }
 
-            .monthly {
-                background: #444;
-            }
-
             table {
                 width: 100%;
                 border-collapse: collapse;
@@ -285,6 +641,22 @@ def home():
                 padding: 12px;
                 border: 1px solid #ddd;
                 text-align: left;
+            }
+
+            @media(max-width:600px) {
+
+                body {
+                    padding: 15px;
+                }
+
+                table {
+                    font-size: 13px;
+                }
+
+                th, td {
+                    padding: 8px;
+                }
+
             }
 
         </style>
@@ -321,7 +693,7 @@ def home():
 
                 <a
                     href="/monthly"
-                    class="button monthly"
+                    class="button"
                 >
                     📈 Monthly Percentage
                 </a>
@@ -334,9 +706,17 @@ def home():
         <table>
 
             <tr>
-                <th>Register Number</th>
-                <th>Name</th>
+
+                <th>
+                    Register Number
+                </th>
+
+                <th>
+                    Name
+                </th>
+
             </tr>
+
 
             {% for student in students %}
 
@@ -361,6 +741,7 @@ def home():
     </html>
     """
 
+
     return render_template_string(
         html,
         students=students,
@@ -368,9 +749,9 @@ def home():
     )
 
 
-# --------------------------------
-# ATTENDANCE PAGE
-# --------------------------------
+# ============================================================
+# ATTENDANCE / SCAN PAGE
+# ============================================================
 
 @app.route(
     "/scan",
@@ -378,19 +759,21 @@ def home():
 )
 def scan():
 
-    # --------------------------------
-    # QR SECURITY
-    # --------------------------------
+    # --------------------------------------------------------
+    # QR + LOCATION SECURITY
+    # --------------------------------------------------------
 
     if not qr_required():
 
-        return render_template_string(
-            """
+        return render_template_string("""
             <!DOCTYPE html>
 
             <html>
 
             <head>
+
+                <meta name="viewport"
+                      content="width=device-width, initial-scale=1">
 
                 <title>Access Denied</title>
 
@@ -400,13 +783,13 @@ def scan():
                         font-family: Arial;
                         background: #f4f6f8;
                         text-align: center;
-                        padding-top: 100px;
+                        padding: 80px 20px;
                     }
 
                     .box {
-                        background: white;
                         max-width: 500px;
                         margin: auto;
+                        background: white;
                         padding: 35px;
                         border-radius: 15px;
                     }
@@ -429,7 +812,8 @@ def scan():
 
                     <p>
                         Please scan the official
-                        Attendance QR Code to continue.
+                        Attendance QR Code from inside
+                        the college.
                     </p>
 
                 </div>
@@ -437,13 +821,12 @@ def scan():
             </body>
 
             </html>
-            """
-        )
+        """)
 
 
-    # --------------------------------
+    # --------------------------------------------------------
     # POST
-    # --------------------------------
+    # --------------------------------------------------------
 
     if request.method == "POST":
 
@@ -453,9 +836,9 @@ def scan():
         ).strip()
 
 
-        # --------------------------------
+        # ----------------------------------------------------
         # CONFIRM ATTENDANCE
-        # --------------------------------
+        # ----------------------------------------------------
 
         if request.form.get("confirm") == "yes":
 
@@ -478,8 +861,7 @@ def scan():
 
                 conn.close()
 
-                return render_template_string(
-                    """
+                return render_template_string("""
                     <html>
 
                     <body style="
@@ -499,8 +881,7 @@ def scan():
                     </body>
 
                     </html>
-                    """
-                )
+                """)
 
 
             now = datetime.now()
@@ -514,9 +895,9 @@ def scan():
             )
 
 
-            # --------------------------------
-            # CHECK DUPLICATE
-            # --------------------------------
+            # ------------------------------------------------
+            # DUPLICATE CHECK
+            # ------------------------------------------------
 
             cursor.execute(
                 """
@@ -538,13 +919,15 @@ def scan():
 
                 conn.close()
 
-                return render_template_string(
-                    """
+                return render_template_string("""
                     <!DOCTYPE html>
 
                     <html>
 
                     <head>
+
+                        <meta name="viewport"
+                              content="width=device-width, initial-scale=1">
 
                         <title>Already Marked</title>
 
@@ -617,15 +1000,15 @@ def scan():
                     </body>
 
                     </html>
-                    """,
-                    name=student[1],
-                    student_id=student[0]
+                """,
+                name=student[1],
+                student_id=student[0]
                 )
 
 
-            # --------------------------------
+            # ------------------------------------------------
             # SAVE ATTENDANCE
-            # --------------------------------
+            # ------------------------------------------------
 
             cursor.execute(
                 """
@@ -644,17 +1027,19 @@ def scan():
             conn.close()
 
 
-            # --------------------------------
+            # ------------------------------------------------
             # SUCCESS
-            # --------------------------------
+            # ------------------------------------------------
 
-            return render_template_string(
-                """
+            return render_template_string("""
                 <!DOCTYPE html>
 
                 <html>
 
                 <head>
+
+                    <meta name="viewport"
+                          content="width=device-width, initial-scale=1">
 
                     <title>Attendance Submitted</title>
 
@@ -745,22 +1130,21 @@ def scan():
                 </body>
 
                 </html>
-                """,
-                name=student[1],
-                student_id=student[0],
-                date=date,
-                time=time
+            """,
+            name=student[1],
+            student_id=student[0],
+            date=date,
+            time=time
             )
 
 
-        # --------------------------------
-        # REGISTER NUMBER
-        # --------------------------------
+        # ----------------------------------------------------
+        # EMPTY REGISTER NUMBER
+        # ----------------------------------------------------
 
         if not student_id:
 
-            return render_template_string(
-                """
+            return render_template_string("""
                 <html>
 
                 <body style="
@@ -780,13 +1164,12 @@ def scan():
                 </body>
 
                 </html>
-                """
-            )
+            """)
 
 
-        # --------------------------------
+        # ----------------------------------------------------
         # FIND STUDENT
-        # --------------------------------
+        # ----------------------------------------------------
 
         conn = connect_db()
         cursor = conn.cursor()
@@ -807,8 +1190,7 @@ def scan():
 
         if not student:
 
-            return render_template_string(
-                """
+            return render_template_string("""
                 <html>
 
                 <body style="
@@ -845,23 +1227,24 @@ def scan():
                 </body>
 
                 </html>
-                """
-            )
+            """)
 
 
-        # --------------------------------
+        # ----------------------------------------------------
         # CONFIRMATION PAGE
-        # --------------------------------
+        # ----------------------------------------------------
 
         now = datetime.now()
 
-        return render_template_string(
-            """
+        return render_template_string("""
             <!DOCTYPE html>
 
             <html>
 
             <head>
+
+                <meta name="viewport"
+                      content="width=device-width, initial-scale=1">
 
                 <title>Confirm Attendance</title>
 
@@ -997,127 +1380,129 @@ def scan():
             </body>
 
             </html>
-            """,
-            name=student[1],
-            student_id=student[0],
-            date=now.strftime("%Y-%m-%d"),
-            time=now.strftime("%H:%M:%S")
+        """,
+        name=student[1],
+        student_id=student[0],
+        date=now.strftime("%Y-%m-%d"),
+        time=now.strftime("%H:%M:%S")
         )
 
 
-    # --------------------------------
+    # --------------------------------------------------------
     # GET ATTENDANCE PAGE
-    # --------------------------------
+    # --------------------------------------------------------
 
-    html = """
-    <!DOCTYPE html>
+    return render_template_string("""
+        <!DOCTYPE html>
 
-    <html>
+        <html>
 
-    <head>
+        <head>
 
-        <title>Mark Attendance</title>
+            <meta name="viewport"
+                  content="width=device-width, initial-scale=1">
 
-        <style>
+            <title>Mark Attendance</title>
 
-            body {
-                font-family: Arial;
-                background: #f4f6f8;
-                margin: 30px;
-            }
+            <style>
 
-            .box {
-                max-width: 600px;
-                margin: 60px auto;
-                background: white;
-                padding: 35px;
-                border-radius: 15px;
-            }
+                body {
+                    font-family: Arial;
+                    background: #f4f6f8;
+                    margin: 0;
+                    padding: 30px;
+                }
 
-            h1 {
-                text-align: center;
-            }
+                .box {
+                    max-width: 600px;
+                    margin: 60px auto;
+                    background: white;
+                    padding: 35px;
+                    border-radius: 15px;
+                }
 
-            input {
-                width: 100%;
-                box-sizing: border-box;
-                padding: 15px;
-                font-size: 18px;
-                margin-top: 20px;
-                margin-bottom: 20px;
-                border: 1px solid #aaa;
-                border-radius: 8px;
-            }
+                h1 {
+                    text-align: center;
+                }
 
-            button {
-                width: 100%;
-                padding: 15px;
-                background: green;
-                color: white;
-                border: none;
-                border-radius: 8px;
-                font-size: 18px;
-            }
+                input {
+                    width: 100%;
+                    box-sizing: border-box;
+                    padding: 15px;
+                    font-size: 18px;
+                    margin-top: 20px;
+                    margin-bottom: 20px;
+                    border: 1px solid #aaa;
+                    border-radius: 8px;
+                }
 
-            .back {
-                display: block;
-                text-align: center;
-                margin-top: 20px;
-                color: #333;
-            }
+                button {
+                    width: 100%;
+                    padding: 15px;
+                    background: green;
+                    color: white;
+                    border: none;
+                    border-radius: 8px;
+                    font-size: 18px;
+                }
 
-        </style>
+                .back {
+                    display: block;
+                    text-align: center;
+                    margin-top: 20px;
+                    color: #333;
+                }
 
-    </head>
+            </style>
 
-    <body>
+        </head>
 
-        <div class="box">
+        <body>
 
-            <h1>
-                📱 Smart QR Attendance
-            </h1>
+            <div class="box">
 
-            <p style="text-align:center;">
-                Enter your Register Number
-            </p>
+                <h1>
+                    📱 Smart QR Attendance
+                </h1>
 
-            <form method="POST">
+                <p style="text-align:center;">
+                    Enter your Register Number
+                </p>
 
-                <input
-                    type="text"
-                    name="student_id"
-                    placeholder="Enter Register Number"
-                    required
-                    autocomplete="off"
+                <form method="POST">
+
+                    <input
+                        type="text"
+                        name="student_id"
+                        placeholder="Enter Register Number"
+                        required
+                        autocomplete="off"
+                    >
+
+                    <button type="submit">
+                        🔍 Check Details
+                    </button>
+
+                </form>
+
+                <a
+                    href="/"
+                    class="back"
                 >
+                    ← Back to Home
+                </a>
 
-                <button type="submit">
-                    🔍 Check Details
-                </button>
+            </div>
 
-            </form>
+        </body>
 
-            <a
-                href="/"
-                class="back"
-            >
-                ← Back to Home
-            </a>
-
-        </div>
-
-    </body>
-
-    </html>
-    """
-
-    return render_template_string(html)
+        </html>
+    """)
 
 
-# --------------------------------
+# ============================================================
 # MONTHLY ATTENDANCE
-# --------------------------------
+# ============================================================
 
 @app.route(
     "/monthly",
@@ -1125,11 +1510,13 @@ def scan():
 )
 def monthly():
 
-    # QR protection
+    # --------------------------------------------------------
+    # SECURITY
+    # --------------------------------------------------------
+
     if not qr_required():
 
-        return render_template_string(
-            """
+        return render_template_string("""
             <html>
 
             <body style="
@@ -1143,19 +1530,23 @@ def monthly():
             </h1>
 
             <p>
-                Please scan the Attendance QR Code first.
+                Please scan the Attendance QR Code
+                from inside the college first.
             </p>
 
             </body>
 
             </html>
-            """
-        )
+        """)
 
 
     result = None
     error = None
 
+
+    # --------------------------------------------------------
+    # POST
+    # --------------------------------------------------------
 
     if request.method == "POST":
 
@@ -1201,7 +1592,6 @@ def monthly():
 
                     conn = connect_db()
                     cursor = conn.cursor()
-
 
                     cursor.execute(
                         """
@@ -1257,6 +1647,7 @@ def monthly():
 
 
                         result = {
+
                             "student_id":
                                 student[0],
 
@@ -1293,12 +1684,19 @@ def monthly():
                 )
 
 
+    # --------------------------------------------------------
+    # MONTHLY HTML
+    # --------------------------------------------------------
+
     html = """
     <!DOCTYPE html>
 
     <html>
 
     <head>
+
+        <meta name="viewport"
+              content="width=device-width, initial-scale=1">
 
         <title>Monthly Attendance</title>
 
@@ -1404,7 +1802,8 @@ def monthly():
             </h1>
 
             <p style="text-align:center;">
-                Check one student's monthly attendance percentage.
+                Check one student's monthly
+                attendance percentage.
             </p>
 
 
@@ -1501,6 +1900,7 @@ def monthly():
                 </div>
 
                 <div class="percentage">
+
                     📊 {{ result.percentage }}%
 
                     <div style="
@@ -1508,7 +1908,9 @@ def monthly():
                         margin-top:8px;
                         font-weight:normal;
                     ">
+
                         Attendance Percentage
+
                     </div>
 
                 </div>
@@ -1532,6 +1934,7 @@ def monthly():
     </html>
     """
 
+
     return render_template_string(
         html,
         result=result,
@@ -1539,17 +1942,20 @@ def monthly():
     )
 
 
-# --------------------------------
+# ============================================================
 # ATTENDANCE RECORDS
-# --------------------------------
+# ============================================================
 
 @app.route("/attendance")
 def attendance():
 
+    # --------------------------------------------------------
+    # SECURITY
+    # --------------------------------------------------------
+
     if not qr_required():
 
-        return render_template_string(
-            """
+        return render_template_string("""
             <html>
 
             <body style="
@@ -1563,31 +1969,48 @@ def attendance():
             </h1>
 
             <p>
-                Please scan the Attendance QR Code first.
+                Please scan the Attendance QR Code
+                from inside the college first.
             </p>
 
             </body>
 
             </html>
-            """
-        )
+        """)
 
-def get_attendance():
+
+    # --------------------------------------------------------
+    # GET ATTENDANCE
+    # --------------------------------------------------------
+
     conn = connect_db()
     cursor = conn.cursor()
 
     cursor.execute("""
-        SELECT student_id, name, date, time
+        SELECT
+            attendance.student_id,
+            students.name,
+            attendance.date,
+            attendance.time
         FROM attendance
-        ORDER BY date DESC, time DESC
+
+        LEFT JOIN students
+        ON attendance.student_id =
+           students.student_id
+
+        ORDER BY
+            attendance.date DESC,
+            attendance.time DESC
     """)
 
     records = cursor.fetchall()
+
     conn.close()
 
-    return records
-    records = get_attendance()
 
+    # --------------------------------------------------------
+    # HTML
+    # --------------------------------------------------------
 
     html = """
     <!DOCTYPE html>
@@ -1595,6 +2018,9 @@ def get_attendance():
     <html>
 
     <head>
+
+        <meta name="viewport"
+              content="width=device-width, initial-scale=1">
 
         <title>Attendance Records</title>
 
@@ -1633,6 +2059,22 @@ def get_attendance():
                 border-radius: 6px;
             }
 
+            @media(max-width:600px) {
+
+                body {
+                    margin: 10px;
+                }
+
+                table {
+                    font-size: 12px;
+                }
+
+                th, td {
+                    padding: 7px;
+                }
+
+            }
+
         </style>
 
     </head>
@@ -1646,11 +2088,25 @@ def get_attendance():
         <table>
 
             <tr>
-                <th>Register Number</th>
-                <th>Name</th>
-                <th>Date</th>
-                <th>Time</th>
+
+                <th>
+                    Register Number
+                </th>
+
+                <th>
+                    Name
+                </th>
+
+                <th>
+                    Date
+                </th>
+
+                <th>
+                    Time
+                </th>
+
             </tr>
+
 
             {% for record in records %}
 
@@ -1688,15 +2144,16 @@ def get_attendance():
     </html>
     """
 
+
     return render_template_string(
         html,
         records=records
     )
 
 
-# --------------------------------
+# ============================================================
 # START APPLICATION
-# --------------------------------
+# ============================================================
 
 if __name__ == "__main__":
 
@@ -1709,7 +2166,7 @@ if __name__ == "__main__":
     import_students()
 
     print(
-        "Application started!"
+        "Application started successfully!"
     )
 
     print(
