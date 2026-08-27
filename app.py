@@ -1120,9 +1120,9 @@ def scan():
 
                         <a
                             class="button"
-                            href="/scan"
+                            href="/"
                         >
-                            📱 Mark Another Student
+                            🏠 Back to Home
                         </a>
 
                     </div>
