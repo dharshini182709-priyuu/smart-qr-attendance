@@ -1,6 +1,7 @@
 import csv
 import sqlite3
 import math
+import secrets
 from datetime import datetime
 
 from flask import (
@@ -20,7 +21,7 @@ COLLEGE_LAT = 11.0679090
 COLLEGE_LON = 77.0833440
 
 # Allowed radius in metres
-ALLOWED_RADIUS = 200
+ALLOWED_RADIUS = 500
 
 
 # ============================================================
@@ -55,6 +56,11 @@ CSV_FILE = "students.csv"
 def connect_db():
     conn = sqlite3.connect(DB_NAME)
     return conn
+
+
+def get_device_id():
+    """Read the browser-generated device token sent with an attendance form."""
+    return (request.form.get("device_id") or "").strip()
 
 
 # ============================================================
@@ -115,8 +121,28 @@ def create_tables():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             student_id TEXT NOT NULL,
             date TEXT NOT NULL,
-            time TEXT NOT NULL
+            time TEXT NOT NULL,
+            device_id TEXT
         )
+    """)
+
+    # Upgrade an older attendance.db created before device restriction was added.
+    cursor.execute("PRAGMA table_info(attendance)")
+    columns = [row[1] for row in cursor.fetchall()]
+    if "device_id" not in columns:
+        cursor.execute("ALTER TABLE attendance ADD COLUMN device_id TEXT")
+
+    # One device can submit attendance only once per calendar day.
+    cursor.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_attendance_device_date
+        ON attendance(device_id, date)
+        WHERE device_id IS NOT NULL AND device_id != ''
+    """)
+
+    # A student can also submit only once per day.
+    cursor.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_attendance_student_date
+        ON attendance(student_id, date)
     """)
 
     conn.commit()
@@ -842,6 +868,17 @@ def scan():
 
         if request.form.get("confirm") == "yes":
 
+            device_id = get_device_id()
+
+            if not device_id or len(device_id) < 20:
+                return render_template_string("""
+                    <html><body style="font-family:Arial;text-align:center;margin-top:80px;">
+                    <h2 style="color:red;">❌ Device verification failed</h2>
+                    <p>Please refresh the page and try again.</p>
+                    <a href="/scan">Try Again</a>
+                    </body></html>
+                """)
+
             conn = connect_db()
             cursor = conn.cursor()
 
@@ -913,6 +950,37 @@ def scan():
             )
 
             already_marked = cursor.fetchone()
+
+            # One phone/browser device can mark attendance only once per day.
+            cursor.execute(
+                """
+                SELECT attendance.student_id, students.name
+                FROM attendance
+                LEFT JOIN students
+                ON attendance.student_id = students.student_id
+                WHERE attendance.device_id = ?
+                AND attendance.date = ?
+                LIMIT 1
+                """,
+                (device_id, date)
+            )
+            device_already_marked = cursor.fetchone()
+
+            if device_already_marked:
+                conn.close()
+                return render_template_string("""
+                    <!DOCTYPE html>
+                    <html><head><meta name="viewport" content="width=device-width, initial-scale=1">
+                    <title>Device Already Used</title>
+                    <style>body{font-family:Arial;background:#f4f6f8;text-align:center;padding-top:70px}.box{background:white;max-width:500px;margin:auto;padding:35px;border-radius:15px}h1{color:#d97706}.button{display:inline-block;margin-top:20px;padding:12px 25px;background:#222;color:white;text-decoration:none;border-radius:6px}</style>
+                    </head><body><div class="box">
+                    <h1>📱 Device Already Used</h1>
+                    <h2>{{ marked_name }}</h2>
+                    <p>This phone/device has already marked attendance today.</p>
+                    <p>Only <b>one attendance per device per day</b> is allowed.</p>
+                    <a class="button" href="/scan">← Back</a>
+                    </div></body></html>
+                """, marked_name=device_already_marked[1] or "Student")
 
 
             if already_marked:
@@ -1013,13 +1081,14 @@ def scan():
             cursor.execute(
                 """
                 INSERT INTO attendance
-                (student_id, date, time)
-                VALUES (?, ?, ?)
+                (student_id, date, time, device_id)
+                VALUES (?, ?, ?, ?)
                 """,
                 (
                     student[0],
                     date,
-                    time
+                    time,
+                    device_id
                 )
             )
 
@@ -1359,6 +1428,13 @@ def scan():
                             value="yes"
                         >
 
+                        <input
+                            type="hidden"
+                            name="device_id"
+                            id="device_id"
+                            value=""
+                        >
+
                         <button
                             type="submit"
                             class="confirm"
@@ -1374,6 +1450,22 @@ def scan():
                     >
                         ❌ Cancel / Enter Again
                     </a>
+
+                    <script>
+                        function getDeviceToken() {
+                            let token = localStorage.getItem("smartqr_device_token");
+                            if (!token) {
+                                if (window.crypto && crypto.randomUUID) {
+                                    token = crypto.randomUUID();
+                                } else {
+                                    token = "dev-" + Date.now() + "-" + Math.random().toString(36).slice(2) + "-" + Math.random().toString(36).slice(2);
+                                }
+                                localStorage.setItem("smartqr_device_token", token);
+                            }
+                            return token;
+                        }
+                        document.getElementById("device_id").value = getDeviceToken();
+                    </script>
 
                 </div>
 
@@ -1645,6 +1737,17 @@ def monthly():
                             working_days
                         ) * 100
 
+                        # Attendance warning levels
+                        if percentage <= 75:
+                            attendance_alert = "🚨 LOW ATTENDANCE ALERT: Your attendance is 75% or below. Please improve your attendance."
+                            alert_type = "low"
+                        elif percentage < 80:
+                            attendance_alert = "⚠️ WARNING: Your attendance is below 80%. Please improve your attendance."
+                            alert_type = "warning"
+                        else:
+                            attendance_alert = "✅ GOOD ATTENDANCE: Your attendance is 80% or above."
+                            alert_type = "good"
+
 
                         result = {
 
@@ -1670,7 +1773,10 @@ def monthly():
                                 round(
                                     percentage,
                                     2
-                                )
+                                ),
+
+                            "alert": attendance_alert,
+                            "alert_type": alert_type
                         }
 
 
@@ -1780,6 +1886,19 @@ def monthly():
                 font-size: 28px;
                 font-weight: bold;
             }
+
+            .alert {
+                margin-top: 20px;
+                padding: 16px;
+                border-radius: 10px;
+                text-align: center;
+                font-size: 16px;
+                font-weight: bold;
+            }
+
+            .alert.good { background: #e8f7e8; color: #176b2c; }
+            .alert.warning { background: #fff4cc; color: #8a5a00; }
+            .alert.low { background: #ffe0e0; color: #a00000; }
 
             .back {
                 display: block;
@@ -1913,6 +2032,10 @@ def monthly():
 
                     </div>
 
+                </div>
+
+                <div class="alert {{ result.alert_type }}">
+                    {{ result.alert }}
                 </div>
 
             </div>
