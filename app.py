@@ -59,8 +59,17 @@ def connect_db():
 
 
 def get_device_id():
-    """Read the browser-generated device token sent with an attendance form."""
-    return (request.form.get("device_id") or "").strip()
+    """Get a stable browser/device token from the submitted form, cookie, or session."""
+    token = (request.form.get("device_id") or "").strip()
+    if token:
+        return token
+
+    token = request.cookies.get("smartqr_device_token", "").strip()
+    if token:
+        return token
+
+    token = session.get("smartqr_device_token", "").strip()
+    return token
 
 
 # ============================================================
@@ -1452,18 +1461,41 @@ def scan():
                     </a>
 
                     <script>
+                        function getCookie(name) {
+                            const prefix = name + "=";
+                            const parts = document.cookie.split(";");
+                            for (let part of parts) {
+                                part = part.trim();
+                                if (part.startsWith(prefix)) {
+                                    return decodeURIComponent(part.substring(prefix.length));
+                                }
+                            }
+                            return "";
+                        }
+
                         function getDeviceToken() {
-                            let token = localStorage.getItem("smartqr_device_token");
+                            // Prefer the persistent browser cookie.
+                            let token = getCookie("smartqr_device_token");
+
+                            // Fall back to localStorage for browsers where the cookie is absent.
+                            if (!token) {
+                                token = localStorage.getItem("smartqr_device_token") || "";
+                            }
+
                             if (!token) {
                                 if (window.crypto && crypto.randomUUID) {
                                     token = crypto.randomUUID();
                                 } else {
                                     token = "dev-" + Date.now() + "-" + Math.random().toString(36).slice(2) + "-" + Math.random().toString(36).slice(2);
                                 }
-                                localStorage.setItem("smartqr_device_token", token);
                             }
+
+                            // Keep both stores synchronized so the same browser keeps one token.
+                            localStorage.setItem("smartqr_device_token", token);
+                            document.cookie = "smartqr_device_token=" + encodeURIComponent(token) + "; path=/; max-age=31536000; SameSite=Lax";
                             return token;
                         }
+
                         document.getElementById("device_id").value = getDeviceToken();
                     </script>
 
