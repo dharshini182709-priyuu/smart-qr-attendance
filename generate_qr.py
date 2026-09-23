@@ -1,6 +1,6 @@
 import qrcode
 
-url = "https://handyman-presuming-slit.ngrok-free.dev/access/SMARTQR2026"
+url = "https://smart-qr-attendance-vccq.onrender.com/access/SMARTQR2026"
 qr = qrcode.make(url)
 
 qr.save("common_attendance_qr.png")
