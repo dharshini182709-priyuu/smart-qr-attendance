@@ -21,7 +21,7 @@ COLLEGE_LAT = 11.0679090
 COLLEGE_LON = 77.0833440
 
 # Allowed radius in metres
-ALLOWED_RADIUS = 400
+ALLOWED_RADIUS = 500
 
 
 # ============================================================
@@ -2278,15 +2278,16 @@ def attendance():
 # START APPLICATION
 # ============================================================
 
+# Gunicorn imports this module instead of running it as __main__.
+# Initialize the SQLite database and import students during module load.
+create_tables()
+import_students()
+
 if __name__ == "__main__":
 
     print(
         "Starting Smart QR Attendance..."
     )
-
-    create_tables()
-
-    import_students()
 
     print(
         "Application started successfully!"
