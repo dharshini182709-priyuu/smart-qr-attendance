@@ -1,7 +1,9 @@
 import csv
-import sqlite3
 import math
 import secrets
+import os
+
+import psycopg2
 from datetime import datetime
 
 from flask import (
@@ -21,7 +23,7 @@ COLLEGE_LAT = 11.0679090
 COLLEGE_LON = 77.0833440
 
 # Allowed radius in metres
-ALLOWED_RADIUS = 100
+ALLOWED_RADIUS = 500
 
 
 # ============================================================
@@ -45,8 +47,13 @@ QR_TOKEN = "SMARTQR2026"
 # DATABASE / CSV
 # ============================================================
 
-DB_NAME = "attendance.db"
+DATABASE_URL = os.environ.get("DATABASE_URL")
 CSV_FILE = "students.csv"
+
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL environment variable is not set. Configure it in Render.")
+
+# Render may provide a postgres:// URL; psycopg2 accepts the PostgreSQL scheme.
 
 
 # ============================================================
@@ -54,8 +61,7 @@ CSV_FILE = "students.csv"
 # ============================================================
 
 def connect_db():
-    conn = sqlite3.connect(DB_NAME)
-    return conn
+    return psycopg2.connect(DATABASE_URL)
 
 
 def get_device_id():
@@ -127,19 +133,13 @@ def create_tables():
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS attendance (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id BIGSERIAL PRIMARY KEY,
             student_id TEXT NOT NULL,
             date TEXT NOT NULL,
             time TEXT NOT NULL,
             device_id TEXT
         )
     """)
-
-    # Upgrade an older attendance.db created before device restriction was added.
-    cursor.execute("PRAGMA table_info(attendance)")
-    columns = [row[1] for row in cursor.fetchall()]
-    if "device_id" not in columns:
-        cursor.execute("ALTER TABLE attendance ADD COLUMN device_id TEXT")
 
     # One device can submit attendance only once per calendar day.
     cursor.execute("""
@@ -198,9 +198,11 @@ def import_students():
 
                     cursor.execute(
                         """
-                        INSERT OR REPLACE INTO students
+                        INSERT INTO students
                         (student_id, name)
-                        VALUES (?, ?)
+                        VALUES (%s, %s)
+                        ON CONFLICT (student_id)
+                        DO UPDATE SET name = EXCLUDED.name
                         """,
                         (student_id, name)
                     )
@@ -895,7 +897,7 @@ def scan():
                 """
                 SELECT student_id, name
                 FROM students
-                WHERE student_id = ?
+                WHERE student_id = %s
                 """,
                 (student_id,)
             )
@@ -937,7 +939,7 @@ def scan():
             )
 
             time = now.strftime(
-                "%H:%M:%S"
+                "%I:%M:%S %p"
             )
 
 
@@ -949,8 +951,8 @@ def scan():
                 """
                 SELECT id
                 FROM attendance
-                WHERE student_id = ?
-                AND date = ?
+                WHERE student_id = %s
+                AND date = %s
                 """,
                 (
                     student[0],
@@ -967,8 +969,8 @@ def scan():
                 FROM attendance
                 LEFT JOIN students
                 ON attendance.student_id = students.student_id
-                WHERE attendance.device_id = ?
-                AND attendance.date = ?
+                WHERE attendance.device_id = %s
+                AND attendance.date = %s
                 LIMIT 1
                 """,
                 (device_id, date)
@@ -1091,7 +1093,7 @@ def scan():
                 """
                 INSERT INTO attendance
                 (student_id, date, time, device_id)
-                VALUES (?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s)
                 """,
                 (
                     student[0],
@@ -1256,7 +1258,7 @@ def scan():
             """
             SELECT student_id, name
             FROM students
-            WHERE student_id = ?
+            WHERE student_id = %s
             """,
             (student_id,)
         )
@@ -1508,7 +1510,7 @@ def scan():
         name=student[1],
         student_id=student[0],
         date=now.strftime("%Y-%m-%d"),
-        time=now.strftime("%H:%M:%S")
+        time=now.strftime("%I:%M:%S %p")
         )
 
 
@@ -1721,7 +1723,7 @@ def monthly():
                         """
                         SELECT student_id, name
                         FROM students
-                        WHERE student_id = ?
+                        WHERE student_id = %s
                         """,
                         (student_id,)
                     )
@@ -1741,8 +1743,8 @@ def monthly():
                             """
                             SELECT COUNT(DISTINCT date)
                             FROM attendance
-                            WHERE student_id = ?
-                            AND substr(date, 1, 7) = ?
+                            WHERE student_id = %s
+                            AND substr(date, 1, 7) = %s
                             """,
                             (
                                 student_id,
