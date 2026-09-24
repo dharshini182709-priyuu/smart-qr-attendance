@@ -2,3 +2,5 @@ Flask
 qrcode[pil]
 pyngrok
 gunicorn
+psycopg2-binary
+
