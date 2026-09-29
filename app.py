@@ -19,11 +19,11 @@ from flask import (
 # COLLEGE LOCATION SETTINGS
 # ============================================================
 
-COLLEGE_LAT = 11.0679090
-COLLEGE_LON = 77.0833440
+COLLEGE_LAT = 11.067884
+COLLEGE_LON = 77.083517
 
 # Allowed radius in metres
-ALLOWED_RADIUS = 500
+ALLOWED_RADIUS = 100
 
 
 # ============================================================
