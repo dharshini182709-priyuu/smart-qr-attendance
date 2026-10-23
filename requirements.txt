@@ -1,6 +1,6 @@
 Flask
-qrcode[pil]
-pyngrok
-gunicorn
 psycopg2-binary
-
+pandas
+openpyxl
+qrcode
+Pillow
