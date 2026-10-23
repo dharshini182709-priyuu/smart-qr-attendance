@@ -1,100 +1,225 @@
+
+import os
 import csv
 import math
-import secrets
-import os
+from datetime import datetime, date
+from functools import wraps
 
 import psycopg2
-from datetime import datetime
+from psycopg2.extras import RealDictCursor
 
 from flask import (
-    Flask,
-    render_template_string,
-    request,
-    redirect,
-    session,
-    jsonify
+    Flask, request, session, redirect,
+    url_for, render_template_string, jsonify
 )
 
-# ============================================================
-# COLLEGE LOCATION SETTINGS
-# ============================================================
+app = Flask(__name__)
+app.secret_key = os.environ.get(
+    "FLASK_SECRET_KEY", "change-this-secret-key"
+)
 
-COLLEGE_LAT = 11.067884
-COLLEGE_LON = 77.083517
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+CSV_FILE = "students.csv"
+QR_TOKEN = os.environ.get("QR_TOKEN", "SMARTQR2026")
 
-# Allowed radius in metres
+COLLEGE_LAT = float(os.environ.get("COLLEGE_LAT", "11.067294"))
+COLLEGE_LON = float(os.environ.get("COLLEGE_LON", "77.083478"))
 ALLOWED_RADIUS = 100
 
+# Change these times to match your college timetable.
+MORNING_START = os.environ.get("MORNING_START", "09:00")
+MORNING_END = os.environ.get("MORNING_END", "09:30")
+AFTERNOON_START = os.environ.get("AFTERNOON_START", "13:20")
+AFTERNOON_END = os.environ.get("AFTERNOON_END", "13:45")
 
-# ============================================================
-# FLASK APP
-# ============================================================
-
-app = Flask(__name__)
-
-# Secret key for session
-app.secret_key = "smartqr-secret-key-2026"
-
-
-# ============================================================
-# QR TOKEN
-# ============================================================
-
-QR_TOKEN = "SMARTQR2026"
-
-
-# ============================================================
-# DATABASE / CSV
-# ============================================================
-
-DATABASE_URL = os.environ.get("DATABASE_URL")
-CSV_FILE = "students.csv"
+ADMINS = {
+    os.environ.get("ADMIN1_USERNAME", "admin1"):
+        os.environ.get("ADMIN1_PASSWORD", "ChangeMe123!"),
+    os.environ.get("ADMIN2_USERNAME", "admin2"):
+        os.environ.get("ADMIN2_PASSWORD", "ChangeMe456!")
+}
 
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL environment variable is not set. Configure it in Render.")
-
-# Render may provide a postgres:// URL; psycopg2 accepts the PostgreSQL scheme.
-
-
-# ============================================================
-# DATABASE CONNECTION
-# ============================================================
-
-def connect_db():
-    return psycopg2.connect(DATABASE_URL)
+    raise RuntimeError(
+        "DATABASE_URL is missing. Configure Render PostgreSQL."
+    )
 
 
-def get_device_id():
-    """Get a stable browser/device token from the submitted form, cookie, or session."""
-    token = (request.form.get("device_id") or "").strip()
-    if token:
-        return token
-
-    token = request.cookies.get("smartqr_device_token", "").strip()
-    if token:
-        return token
-
-    token = session.get("smartqr_device_token", "").strip()
-    return token
+def db():
+    return psycopg2.connect(
+        DATABASE_URL,
+        cursor_factory=RealDictCursor
+    )
 
 
-# ============================================================
-# CHECK LOCATION
-# ============================================================
+# --------------------------------------------------
+# DATABASE SETUP AND SAFE ADDITIVE MIGRATION
+# --------------------------------------------------
 
-def is_inside_college(latitude, longitude):
+def init_db():
+    conn = db()
 
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS students (
+                    student_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    parent_phone TEXT
+                )
+            """)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS attendance (
+                    id BIGSERIAL PRIMARY KEY,
+                    student_id TEXT NOT NULL,
+                    date TEXT NOT NULL,
+                    time TEXT NOT NULL,
+                    device_id TEXT,
+                    session_name TEXT,
+                    status TEXT DEFAULT 'Present',
+                    marked_by TEXT DEFAULT 'QR',
+                    reason TEXT
+                )
+            """)
+
+            cur.execute("""
+                ALTER TABLE students
+                ADD COLUMN IF NOT EXISTS parent_phone TEXT
+            """)
+
+            cur.execute("""
+                ALTER TABLE attendance
+                ADD COLUMN IF NOT EXISTS session_name TEXT
+            """)
+
+            cur.execute("""
+                ALTER TABLE attendance
+                ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'Present'
+            """)
+
+            cur.execute("""
+                ALTER TABLE attendance
+                ADD COLUMN IF NOT EXISTS marked_by TEXT DEFAULT 'QR'
+            """)
+
+            cur.execute("""
+                ALTER TABLE attendance
+                ADD COLUMN IF NOT EXISTS reason TEXT
+            """)
+
+            # Keep historical records and classify old daily
+            # records separately from the new session records.
+            cur.execute("""
+                UPDATE attendance
+                SET session_name = 'legacy_full'
+                WHERE session_name IS NULL OR session_name = ''
+            """)
+
+            cur.execute("""
+                UPDATE attendance
+                SET status = 'Present'
+                WHERE status IS NULL OR status = ''
+            """)
+
+            cur.execute("""
+                UPDATE attendance
+                SET marked_by = 'QR'
+                WHERE marked_by IS NULL OR marked_by = ''
+            """)
+
+            # Allow separate morning and afternoon attendance.
+            cur.execute(
+                "DROP INDEX IF EXISTS idx_attendance_student_date"
+            )
+            cur.execute(
+                "DROP INDEX IF EXISTS idx_attendance_device_date"
+            )
+
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS
+                uq_attendance_student_session
+                ON attendance(student_id, date, session_name)
+            """)
+
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS
+                uq_attendance_device_session
+                ON attendance(device_id, date, session_name)
+                WHERE device_id IS NOT NULL
+                  AND device_id <> ''
+                  AND session_name <> 'legacy_full'
+            """)
+
+        conn.commit()
+
+    finally:
+        conn.close()
+
+
+def import_students():
+    if not os.path.exists(CSV_FILE):
+        return
+
+    conn = db()
+
+    try:
+        with conn.cursor() as cur:
+            with open(
+                CSV_FILE,
+                "r",
+                encoding="utf-8-sig",
+                newline=""
+            ) as file:
+                reader = csv.DictReader(file)
+
+                for row in reader:
+                    sid = (
+                        row.get("student_id")
+                        or row.get("register_no")
+                        or ""
+                    ).strip()
+
+                    name = (row.get("name") or "").strip()
+                    phone = (
+                        row.get("parent_phone") or ""
+                    ).strip() or None
+
+                    if sid and name:
+                        cur.execute("""
+                            INSERT INTO students
+                                (student_id, name, parent_phone)
+                            VALUES (%s, %s, %s)
+                            ON CONFLICT (student_id)
+                            DO UPDATE SET
+                                name = EXCLUDED.name,
+                                parent_phone = COALESCE(
+                                    EXCLUDED.parent_phone,
+                                    students.parent_phone
+                                )
+                        """, (sid, name, phone))
+
+        conn.commit()
+
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------
+# LOCATION VERIFICATION
+# --------------------------------------------------
+
+def inside_college(latitude, longitude):
     try:
         latitude = float(latitude)
         longitude = float(longitude)
     except (TypeError, ValueError):
         return False
 
-    R = 6371000
+    radius = 6371000
 
     lat1 = math.radians(COLLEGE_LAT)
     lat2 = math.radians(latitude)
-
     dlat = math.radians(latitude - COLLEGE_LAT)
     dlon = math.radians(longitude - COLLEGE_LON)
 
@@ -105,2235 +230,844 @@ def is_inside_college(latitude, longitude):
         * math.sin(dlon / 2) ** 2
     )
 
-    c = 2 * math.atan2(
-        math.sqrt(a),
-        math.sqrt(1 - a)
+    a = max(0, min(1, a))
+    distance = 2 * radius * math.atan2(
+        math.sqrt(a), math.sqrt(1 - a)
     )
-
-    distance = R * c
 
     return distance <= ALLOWED_RADIUS
 
 
-# ============================================================
-# CREATE DATABASE TABLES
-# ============================================================
-
-def create_tables():
-
-    conn = connect_db()
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS students (
-            student_id TEXT PRIMARY KEY,
-            name TEXT NOT NULL
-        )
-    """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS attendance (
-            id BIGSERIAL PRIMARY KEY,
-            student_id TEXT NOT NULL,
-            date TEXT NOT NULL,
-            time TEXT NOT NULL,
-            device_id TEXT
-        )
-    """)
-
-    # One device can submit attendance only once per calendar day.
-    cursor.execute("""
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_attendance_device_date
-        ON attendance(device_id, date)
-        WHERE device_id IS NOT NULL AND device_id != ''
-    """)
-
-    # A student can also submit only once per day.
-    cursor.execute("""
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_attendance_student_date
-        ON attendance(student_id, date)
-    """)
-
-    conn.commit()
-    conn.close()
-
-
-# ============================================================
-# IMPORT STUDENTS FROM CSV
-# ============================================================
-
-def import_students():
-
-    print("Reading students.csv...")
-
-    try:
-
-        conn = connect_db()
-        cursor = conn.cursor()
-
-        with open(
-            CSV_FILE,
-            "r",
-            encoding="utf-8-sig",
-            newline=""
-        ) as file:
-
-            reader = csv.DictReader(file)
-
-            print("CSV columns:", reader.fieldnames)
-
-            count = 0
-
-            for row in reader:
-
-                student_id = str(
-                    row.get("student_id", "")
-                ).strip()
-
-                name = str(
-                    row.get("name", "")
-                ).strip()
-
-                if student_id and name:
-
-                    cursor.execute(
-                        """
-                        INSERT INTO students
-                        (student_id, name)
-                        VALUES (%s, %s)
-                        ON CONFLICT (student_id)
-                        DO UPDATE SET name = EXCLUDED.name
-                        """,
-                        (student_id, name)
-                    )
-
-                    count += 1
-
-        conn.commit()
-        conn.close()
-
-        print(
-            f"{count} students imported successfully!"
-        )
-
-    except Exception as e:
-
-        print(
-            "CSV IMPORT ERROR:",
-            e
-        )
-
-
-# ============================================================
-# QR ACCESS PAGE
-# ============================================================
-
-@app.route("/access/<token>")
-def qr_access(token):
-
-    # --------------------------------------------------------
-    # CHECK QR TOKEN
-    # --------------------------------------------------------
-
-    if token != QR_TOKEN:
-
-        return render_template_string("""
-            <!DOCTYPE html>
-
-            <html>
-
-            <head>
-
-                <title>Invalid QR</title>
-
-                <style>
-
-                    body {
-                        font-family: Arial;
-                        background: #f4f6f8;
-                        text-align: center;
-                        padding: 80px 20px;
-                    }
-
-                    .box {
-                        max-width: 500px;
-                        margin: auto;
-                        background: white;
-                        padding: 35px;
-                        border-radius: 15px;
-                    }
-
-                    h1 {
-                        color: red;
-                    }
-
-                </style>
-
-            </head>
-
-            <body>
-
-                <div class="box">
-
-                    <h1>
-                        ❌ Invalid QR Code
-                    </h1>
-
-                    <p>
-                        This QR code is not valid.
-                    </p>
-
-                </div>
-
-            </body>
-
-            </html>
-        """)
-
-
-    # --------------------------------------------------------
-    # LOCATION VERIFICATION PAGE
-    # --------------------------------------------------------
-
-    return render_template_string("""
-        <!DOCTYPE html>
-
-        <html>
-
-        <head>
-
-            <meta name="viewport"
-                  content="width=device-width, initial-scale=1">
-
-            <title>Verifying Attendance</title>
-
-            <style>
-
-                body {
-                    font-family: Arial;
-                    background: #f4f6f8;
-                    text-align: center;
-                    padding: 60px 20px;
-                }
-
-                .box {
-                    max-width: 500px;
-                    margin: auto;
-                    background: white;
-                    padding: 35px;
-                    border-radius: 15px;
-                    box-shadow: 0 5px 20px rgba(0,0,0,0.08);
-                }
-
-                h1 {
-                    color: #222;
-                }
-
-                .loading {
-                    font-size: 45px;
-                    margin: 20px;
-                }
-
-                button {
-                    padding: 14px 25px;
-                    background: #222;
-                    color: white;
-                    border: none;
-                    border-radius: 8px;
-                    font-size: 17px;
-                }
-
-                #message {
-                    margin-top: 20px;
-                    font-size: 16px;
-                }
-
-            </style>
-
-        </head>
-
-        <body>
-
-            <div class="box">
-
-                <div class="loading">
-                    📍
-                </div>
-
-                <h1>
-                    Verifying Location
-                </h1>
-
-                <p>
-                    Please allow location access.
-                </p>
-
-                <p>
-                    Attendance can be opened only
-                    from inside the college.
-                </p>
-
-                <div id="message">
-                    Checking your location...
-                </div>
-
-            </div>
-
-
-            <script>
-
-                function showMessage(message, color) {
-
-                    const box =
-                        document.getElementById("message");
-
-                    box.innerHTML = message;
-
-                    box.style.color = color;
-                }
-
-
-                function verifyLocation() {
-
-                    if (!navigator.geolocation) {
-
-                        showMessage(
-                            "❌ Location is not supported by this browser.",
-                            "red"
-                        );
-
-                        return;
-                    }
-
-
-                    navigator.geolocation.getCurrentPosition(
-
-                        function(position) {
-
-                            const latitude =
-                                position.coords.latitude;
-
-                            const longitude =
-                                position.coords.longitude;
-
-
-                            fetch("/verify-location", {
-
-                                method: "POST",
-
-                                headers: {
-                                    "Content-Type":
-                                        "application/json"
-                                },
-
-                                body: JSON.stringify({
-                                    latitude: latitude,
-                                    longitude: longitude
-                                })
-
-                            })
-
-                            .then(response =>
-                                response.json()
-                            )
-
-                            .then(data => {
-
-                                if (data.success) {
-
-                                    showMessage(
-                                        "✅ Location verified. Opening attendance...",
-                                        "green"
-                                    );
-
-                                    setTimeout(
-                                        function() {
-                                            window.location.href =
-                                                "/scan";
-                                        },
-                                        800
-                                    );
-
-                                } else {
-
-                                    showMessage(
-                                        "❌ " + data.message,
-                                        "red"
-                                    );
-
-                                }
-
-                            })
-
-                            .catch(error => {
-
-                                showMessage(
-                                    "❌ Unable to verify location.",
-                                    "red"
-                                );
-
-                            });
-
-                        },
-
-                        function(error) {
-
-                            showMessage(
-                                "❌ Please allow location permission to continue.",
-                                "red"
-                            );
-
-                        },
-
-                        {
-                            enableHighAccuracy: true,
-                            timeout: 15000,
-                            maximumAge: 0
-                        }
-
-                    );
-
-                }
-
-
-                verifyLocation();
-
-            </script>
-
-        </body>
-
-        </html>
-    """)
-
-
-# ============================================================
-# VERIFY LOCATION
-# ============================================================
-
-@app.route(
-    "/verify-location",
-    methods=["POST"]
-)
-def verify_location():
-
-    try:
-
-        data = request.get_json()
-
-        latitude = data.get("latitude")
-        longitude = data.get("longitude")
-
-        if latitude is None or longitude is None:
-
-            return jsonify({
-                "success": False,
-                "message": "Location data not available."
-            })
-
-
-        inside = is_inside_college(
-            latitude,
-            longitude
-        )
-
-
-        if inside:
-
-            # Location verified
-            session["location_verified"] = True
-            session["qr_verified"] = True
-
-            return jsonify({
-                "success": True,
-                "message": "Inside college"
-            })
-
-
-        # Outside college
-        session.pop(
-            "location_verified",
-            None
-        )
-
-        session.pop(
-            "qr_verified",
-            None
-        )
-
-        return jsonify({
-            "success": False,
-            "message":
-                "You must be inside the college to access attendance."
-        })
-
-
-    except Exception as e:
-
-        print(
-            "LOCATION ERROR:",
-            e
-        )
-
-        return jsonify({
-            "success": False,
-            "message": "Location verification failed."
-        })
-
-
-# ============================================================
-# SECURITY CHECK
-# ============================================================
-
 def qr_required():
-
     return (
         session.get("qr_verified", False)
-        and
-        session.get("location_verified", False)
+        and session.get("location_verified", False)
     )
 
 
-# ============================================================
-# HOME PAGE
-# ============================================================
+# --------------------------------------------------
+# ADMIN AUTHENTICATION
+# --------------------------------------------------
+
+def admin_required(function):
+    @wraps(function)
+    def wrapper(*args, **kwargs):
+        if not session.get("admin_user"):
+            return redirect(url_for("admin_login"))
+
+        return function(*args, **kwargs)
+
+    return wrapper
+
+
+# --------------------------------------------------
+# COMMON HTML LAYOUT
+# --------------------------------------------------
+
+BASE = """
+<!doctype html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ title }}</title>
+<style>
+body {
+    font-family: Arial;
+    background: #f3f5f8;
+    margin: 0;
+    padding: 20px;
+    color: #222;
+}
+.card {
+    max-width: 1100px;
+    margin: 20px auto;
+    background: white;
+    padding: 24px;
+    border-radius: 14px;
+    box-shadow: 0 3px 14px #0001;
+}
+input, select, button {
+    box-sizing: border-box;
+    padding: 11px;
+    margin: 6px 0;
+    max-width: 100%;
+    font-size: 15px;
+}
+input, select {
+    border: 1px solid #bbb;
+    border-radius: 6px;
+}
+button, .btn {
+    background: #222;
+    color: white;
+    border: 0;
+    border-radius: 7px;
+    padding: 11px 16px;
+    text-decoration: none;
+    cursor: pointer;
+    display: inline-block;
+}
+table {
+    border-collapse: collapse;
+    width: 100%;
+    background: white;
+    margin-top: 15px;
+}
+th, td {
+    border: 1px solid #ddd;
+    padding: 10px;
+    text-align: left;
+}
+th {
+    background: #222;
+    color: white;
+}
+.msg {
+    padding: 12px;
+    background: #eef6ee;
+    border-radius: 7px;
+    margin: 12px 0;
+}
+.err {
+    background: #ffe8e8;
+    color: #9b111e;
+}
+.nav {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin: 15px 0;
+}
+@media(max-width:650px) {
+    .card { padding: 13px; margin: 8px auto; overflow-x: auto; }
+    table { font-size: 12px; }
+    th, td { padding: 7px; }
+}
+</style>
+</head>
+<body>
+<div class="card">{{ body|safe }}</div>
+</body>
+</html>
+"""
+
+
+def page(title, body, **context):
+    rendered = render_template_string(body, **context)
+    return render_template_string(
+        BASE, title=title, body=rendered
+    )
+
+
+# --------------------------------------------------
+# HOME
+# --------------------------------------------------
 
 @app.route("/")
 def home():
-
-    conn = connect_db()
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        SELECT student_id, name
-        FROM students
-        ORDER BY student_id
-    """)
-
-    students = cursor.fetchall()
-
-    conn.close()
-
-
-    html = """
-    <!DOCTYPE html>
-
-    <html>
-
-    <head>
-
-        <meta name="viewport"
-              content="width=device-width, initial-scale=1">
-
-        <title>Smart QR Attendance</title>
-
-        <style>
-
-            body {
-                font-family: Arial;
-                background: #f4f6f8;
-                margin: 0;
-                padding: 30px;
-            }
-
-            h1 {
-                color: #222;
-            }
-
-            .box {
-                background: white;
-                padding: 25px;
-                margin-bottom: 25px;
-                border-radius: 12px;
-            }
-
-            .button-container {
-                display: flex;
-                gap: 15px;
-                flex-wrap: wrap;
-                margin-top: 20px;
-            }
-
-            .button {
-                display: inline-block;
-                padding: 13px 22px;
-                background: #222;
-                color: white;
-                text-decoration: none;
-                border-radius: 7px;
-                font-size: 16px;
-            }
-
-            table {
-                width: 100%;
-                border-collapse: collapse;
-                background: white;
-            }
-
-            th {
-                background: #222;
-                color: white;
-            }
-
-            th, td {
-                padding: 12px;
-                border: 1px solid #ddd;
-                text-align: left;
-            }
-
-            @media(max-width:600px) {
-
-                body {
-                    padding: 15px;
-                }
-
-                table {
-                    font-size: 13px;
-                }
-
-                th, td {
-                    padding: 8px;
-                }
-
-            }
-
-        </style>
-
-    </head>
-
-    <body>
-
-        <h1>
-            📱 Smart QR Attendance System
-        </h1>
-
-        <div class="box">
-
-            <h2>
-                Total Students: {{ total }}
-            </h2>
-
-            <div class="button-container">
-
-                <a
-                    href="/scan"
-                    class="button"
-                >
-                    📱 Open Attendance
-                </a>
-
-                <a
-                    href="/attendance"
-                    class="button"
-                >
-                    📊 View Attendance
-                </a>
-
-                <a
-                    href="/monthly"
-                    class="button"
-                >
-                    📈 Monthly Percentage
-                </a>
-
-            </div>
-
-        </div>
-
-
-        <table>
-
-            <tr>
-
-                <th>
-                    Register Number
-                </th>
-
-                <th>
-                    Name
-                </th>
-
-            </tr>
-
-
-            {% for student in students %}
-
-            <tr>
-
-                <td>
-                    {{ student[0] }}
-                </td>
-
-                <td>
-                    {{ student[1] }}
-                </td>
-
-            </tr>
-
-            {% endfor %}
-
-        </table>
-
-    </body>
-
-    </html>
-    """
-
-
-    return render_template_string(
-        html,
-        students=students,
-        total=len(students)
-    )
-
-
-# ============================================================
-# ATTENDANCE / SCAN PAGE
-# ============================================================
-
-@app.route(
-    "/scan",
-    methods=["GET", "POST"]
-)
-def scan():
-
-    # --------------------------------------------------------
-    # QR + LOCATION SECURITY
-    # --------------------------------------------------------
-
-    if not qr_required():
-
-        return render_template_string("""
-            <!DOCTYPE html>
-
-            <html>
-
-            <head>
-
-                <meta name="viewport"
-                      content="width=device-width, initial-scale=1">
-
-                <title>Access Denied</title>
-
-                <style>
-
-                    body {
-                        font-family: Arial;
-                        background: #f4f6f8;
-                        text-align: center;
-                        padding: 80px 20px;
-                    }
-
-                    .box {
-                        max-width: 500px;
-                        margin: auto;
-                        background: white;
-                        padding: 35px;
-                        border-radius: 15px;
-                    }
-
-                    h1 {
-                        color: red;
-                    }
-
-                </style>
-
-            </head>
-
-            <body>
-
-                <div class="box">
-
-                    <h1>
-                        🔒 Access Denied
-                    </h1>
-
-                    <p>
-                        Please scan the official
-                        Attendance QR Code from inside
-                        the college.
-                    </p>
-
-                </div>
-
-            </body>
-
-            </html>
-        """)
-
-
-    # --------------------------------------------------------
-    # POST
-    # --------------------------------------------------------
-
-    if request.method == "POST":
-
-        student_id = request.form.get(
-            "student_id",
-            ""
-        ).strip()
-
-
-        # ----------------------------------------------------
-        # CONFIRM ATTENDANCE
-        # ----------------------------------------------------
-
-        if request.form.get("confirm") == "yes":
-
-            device_id = get_device_id()
-
-            if not device_id or len(device_id) < 20:
-                return render_template_string("""
-                    <html><body style="font-family:Arial;text-align:center;margin-top:80px;">
-                    <h2 style="color:red;">❌ Device verification failed</h2>
-                    <p>Please refresh the page and try again.</p>
-                    <a href="/scan">Try Again</a>
-                    </body></html>
-                """)
-
-            conn = connect_db()
-            cursor = conn.cursor()
-
-            cursor.execute(
-                """
+    conn = db()
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
                 SELECT student_id, name
                 FROM students
-                WHERE student_id = %s
-                """,
-                (student_id,)
-            )
-
-            student = cursor.fetchone()
-
-
-            if not student:
-
-                conn.close()
-
-                return render_template_string("""
-                    <html>
-
-                    <body style="
-                        font-family:Arial;
-                        text-align:center;
-                        margin-top:80px;
-                    ">
-
-                    <h2 style="color:red;">
-                        ❌ Student not found
-                    </h2>
-
-                    <a href="/scan">
-                        Try Again
-                    </a>
-
-                    </body>
-
-                    </html>
-                """)
-
-
-            now = datetime.now()
-
-            date = now.strftime(
-                "%Y-%m-%d"
-            )
-
-            time = now.strftime(
-                "%I:%M:%S %p"
-            )
-
-
-            # ------------------------------------------------
-            # DUPLICATE CHECK
-            # ------------------------------------------------
-
-            cursor.execute(
-                """
-                SELECT id
-                FROM attendance
-                WHERE student_id = %s
-                AND date = %s
-                """,
-                (
-                    student[0],
-                    date
-                )
-            )
-
-            already_marked = cursor.fetchone()
-
-            # One phone/browser device can mark attendance only once per day.
-            cursor.execute(
-                """
-                SELECT attendance.student_id, students.name
-                FROM attendance
-                LEFT JOIN students
-                ON attendance.student_id = students.student_id
-                WHERE attendance.device_id = %s
-                AND attendance.date = %s
-                LIMIT 1
-                """,
-                (device_id, date)
-            )
-            device_already_marked = cursor.fetchone()
-
-            if device_already_marked:
-                conn.close()
-                return render_template_string("""
-                    <!DOCTYPE html>
-                    <html><head><meta name="viewport" content="width=device-width, initial-scale=1">
-                    <title>Device Already Used</title>
-                    <style>body{font-family:Arial;background:#f4f6f8;text-align:center;padding-top:70px}.box{background:white;max-width:500px;margin:auto;padding:35px;border-radius:15px}h1{color:#d97706}.button{display:inline-block;margin-top:20px;padding:12px 25px;background:#222;color:white;text-decoration:none;border-radius:6px}</style>
-                    </head><body><div class="box">
-                    <h1>📱 Device Already Used</h1>
-                    <h2>{{ marked_name }}</h2>
-                    <p>This phone/device has already marked attendance today.</p>
-                    <p>Only <b>one attendance per device per day</b> is allowed.</p>
-                    <a class="button" href="/scan">← Back</a>
-                    </div></body></html>
-                """, marked_name=device_already_marked[1] or "Student")
-
-
-            if already_marked:
-
-                conn.close()
-
-                return render_template_string("""
-                    <!DOCTYPE html>
-
-                    <html>
-
-                    <head>
-
-                        <meta name="viewport"
-                              content="width=device-width, initial-scale=1">
-
-                        <title>Already Marked</title>
-
-                        <style>
-
-                            body {
-                                font-family: Arial;
-                                background: #f4f6f8;
-                                text-align: center;
-                                padding-top: 70px;
-                            }
-
-                            .box {
-                                background: white;
-                                max-width: 500px;
-                                margin: auto;
-                                padding: 35px;
-                                border-radius: 15px;
-                            }
-
-                            h1 {
-                                color: orange;
-                            }
-
-                            .button {
-                                display: inline-block;
-                                margin-top: 20px;
-                                padding: 12px 25px;
-                                background: #222;
-                                color: white;
-                                text-decoration: none;
-                                border-radius: 6px;
-                            }
-
-                        </style>
-
-                    </head>
-
-                    <body>
-
-                        <div class="box">
-
-                            <h1>
-                                ⚠️ Already Marked!
-                            </h1>
-
-                            <h2>
-                                {{ name }}
-                            </h2>
-
-                            <p>
-                                Register Number:
-                                <b>{{ student_id }}</b>
-                            </p>
-
-                            <p>
-                                Attendance for today
-                                has already been submitted.
-                            </p>
-
-                            <a
-                                class="button"
-                                href="/scan"
-                            >
-                                ← Back
-                            </a>
-
-                        </div>
-
-                    </body>
-
-                    </html>
-                """,
-                name=student[1],
-                student_id=student[0]
-                )
-
-
-            # ------------------------------------------------
-            # SAVE ATTENDANCE
-            # ------------------------------------------------
-
-            cursor.execute(
-                """
-                INSERT INTO attendance
-                (student_id, date, time, device_id)
-                VALUES (%s, %s, %s, %s)
-                """,
-                (
-                    student[0],
-                    date,
-                    time,
-                    device_id
-                )
-            )
-
-            conn.commit()
-            conn.close()
-
-
-            # ------------------------------------------------
-            # SUCCESS
-            # ------------------------------------------------
-
-            return render_template_string("""
-                <!DOCTYPE html>
-
-                <html>
-
-                <head>
-
-                    <meta name="viewport"
-                          content="width=device-width, initial-scale=1">
-
-                    <title>Attendance Submitted</title>
-
-                    <style>
-
-                        body {
-                            font-family: Arial;
-                            background: #f4f6f8;
-                            text-align: center;
-                            padding-top: 70px;
-                        }
-
-                        .box {
-                            background: white;
-                            max-width: 500px;
-                            margin: auto;
-                            padding: 35px;
-                            border-radius: 15px;
-                        }
-
-                        h1 {
-                            color: green;
-                        }
-
-                        .details {
-                            background: #f0f8f0;
-                            padding: 20px;
-                            border-radius: 10px;
-                            margin-top: 20px;
-                            text-align: left;
-                        }
-
-                        .button {
-                            display: inline-block;
-                            margin-top: 20px;
-                            padding: 12px 25px;
-                            background: #222;
-                            color: white;
-                            text-decoration: none;
-                            border-radius: 6px;
-                        }
-
-                    </style>
-
-                </head>
-
-                <body>
-
-                    <div class="box">
-
-                        <h1>
-                            ✅ Attendance Submitted!
-                        </h1>
-
-                        <div class="details">
-
-                            <p>
-                                <b>Name:</b>
-                                {{ name }}
-                            </p>
-
-                            <p>
-                                <b>Register Number:</b>
-                                {{ student_id }}
-                            </p>
-
-                            <p>
-                                <b>Date:</b>
-                                {{ date }}
-                            </p>
-
-                            <p>
-                                <b>Time:</b>
-                                {{ time }}
-                            </p>
-
-                        </div>
-
-                        <a
-                            class="button"
-                            href="/"
-                        >
-                            🏠 Back to Home
-                        </a>
-
-                    </div>
-
-                </body>
-
-                </html>
-            """,
-            name=student[1],
-            student_id=student[0],
-            date=date,
-            time=time
-            )
-
-
-        # ----------------------------------------------------
-        # EMPTY REGISTER NUMBER
-        # ----------------------------------------------------
-
-        if not student_id:
-
-            return render_template_string("""
-                <html>
-
-                <body style="
-                    font-family:Arial;
-                    text-align:center;
-                    margin-top:80px;
-                ">
-
-                <h2 style="color:red;">
-                    ❌ Please enter your register number
-                </h2>
-
-                <a href="/scan">
-                    Try Again
-                </a>
-
-                </body>
-
-                </html>
+                ORDER BY student_id
             """)
-
-
-        # ----------------------------------------------------
-        # FIND STUDENT
-        # ----------------------------------------------------
-
-        conn = connect_db()
-        cursor = conn.cursor()
-
-        cursor.execute(
-            """
-            SELECT student_id, name
-            FROM students
-            WHERE student_id = %s
-            """,
-            (student_id,)
-        )
-
-        student = cursor.fetchone()
-
+            students = cur.fetchall()
+    finally:
         conn.close()
 
+    body = """
+    <h1>📱 Smart QR Attendance System</h1>
+    <p>Total Students: <b>{{ students|length }}</b></p>
 
-        if not student:
+    <div class="nav">
+        <a class="btn" href="/admin/login">Admin Login</a>
+        <a class="btn" href="/scan">Student Attendance</a>
+    </div>
 
-            return render_template_string("""
-                <html>
+    <h2>Student List</h2>
+    <table>
+    <tr><th>Register Number</th><th>Name</th></tr>
+    {% for s in students %}
+    <tr><td>{{ s.student_id }}</td><td>{{ s.name }}</td></tr>
+    {% endfor %}
+    </table>
+    """
 
-                <body style="
-                    font-family:Arial;
-                    background:#f4f6f8;
-                    text-align:center;
-                    padding-top:80px;
-                ">
-
-                <div style="
-                    background:white;
-                    max-width:500px;
-                    margin:auto;
-                    padding:35px;
-                    border-radius:15px;
-                ">
-
-                <h1 style="color:red;">
-                    ❌ Invalid Register Number
-                </h1>
-
-                <p>
-                    Please enter a valid register number.
-                </p>
-
-                <br>
-
-                <a href="/scan">
-                    ← Try Again
-                </a>
-
-                </div>
-
-                </body>
-
-                </html>
-            """)
+    return page("Smart QR Attendance", body, students=students)
 
 
-        # ----------------------------------------------------
-        # CONFIRMATION PAGE
-        # ----------------------------------------------------
+# --------------------------------------------------
+# QR ACCESS AND LOCATION CHECK
+# --------------------------------------------------
 
-        now = datetime.now()
-
-        return render_template_string("""
-            <!DOCTYPE html>
-
-            <html>
-
-            <head>
-
-                <meta name="viewport"
-                      content="width=device-width, initial-scale=1">
-
-                <title>Confirm Attendance</title>
-
-                <style>
-
-                    body {
-                        font-family: Arial;
-                        background: #f4f6f8;
-                        margin: 0;
-                        padding: 40px 20px;
-                    }
-
-                    .box {
-                        max-width: 600px;
-                        margin: auto;
-                        background: white;
-                        padding: 35px;
-                        border-radius: 15px;
-                    }
-
-                    h1 {
-                        text-align: center;
-                    }
-
-                    .details {
-                        background: #f5f5f5;
-                        padding: 20px;
-                        border-radius: 10px;
-                        margin-top: 25px;
-                    }
-
-                    .row {
-                        padding: 12px 0;
-                        border-bottom: 1px solid #ddd;
-                        font-size: 17px;
-                    }
-
-                    .confirm {
-                        width: 100%;
-                        padding: 15px;
-                        margin-top: 25px;
-                        background: green;
-                        color: white;
-                        border: none;
-                        border-radius: 8px;
-                        font-size: 18px;
-                    }
-
-                    .cancel {
-                        display: block;
-                        text-align: center;
-                        margin-top: 15px;
-                        padding: 13px;
-                        background: #555;
-                        color: white;
-                        text-decoration: none;
-                        border-radius: 8px;
-                    }
-
-                </style>
-
-            </head>
-
-            <body>
-
-                <div class="box">
-
-                    <h1>
-                        📱 Confirm Attendance
-                    </h1>
-
-                    <p style="text-align:center;">
-                        Please check your details
-                        before submitting.
-                    </p>
-
-                    <div class="details">
-
-                        <div class="row">
-                            <b>👤 Name:</b>
-                            {{ name }}
-                        </div>
-
-                        <div class="row">
-                            <b>🆔 Register Number:</b>
-                            {{ student_id }}
-                        </div>
-
-                        <div class="row">
-                            <b>📅 Date:</b>
-                            {{ date }}
-                        </div>
-
-                        <div class="row">
-                            <b>⏰ Time:</b>
-                            {{ time }}
-                        </div>
-
-                    </div>
-
-                    <form method="POST">
-
-                        <input
-                            type="hidden"
-                            name="student_id"
-                            value="{{ student_id }}"
-                        >
-
-                        <input
-                            type="hidden"
-                            name="confirm"
-                            value="yes"
-                        >
-
-                        <input
-                            type="hidden"
-                            name="device_id"
-                            id="device_id"
-                            value=""
-                        >
-
-                        <button
-                            type="submit"
-                            class="confirm"
-                        >
-                            ✅ Confirm Attendance
-                        </button>
-
-                    </form>
-
-                    <a
-                        href="/scan"
-                        class="cancel"
-                    >
-                        ❌ Cancel / Enter Again
-                    </a>
-
-                    <script>
-                        function getCookie(name) {
-                            const prefix = name + "=";
-                            const parts = document.cookie.split(";");
-                            for (let part of parts) {
-                                part = part.trim();
-                                if (part.startsWith(prefix)) {
-                                    return decodeURIComponent(part.substring(prefix.length));
-                                }
-                            }
-                            return "";
-                        }
-
-                        function getDeviceToken() {
-                            // Prefer the persistent browser cookie.
-                            let token = getCookie("smartqr_device_token");
-
-                            // Fall back to localStorage for browsers where the cookie is absent.
-                            if (!token) {
-                                token = localStorage.getItem("smartqr_device_token") || "";
-                            }
-
-                            if (!token) {
-                                if (window.crypto && crypto.randomUUID) {
-                                    token = crypto.randomUUID();
-                                } else {
-                                    token = "dev-" + Date.now() + "-" + Math.random().toString(36).slice(2) + "-" + Math.random().toString(36).slice(2);
-                                }
-                            }
-
-                            // Keep both stores synchronized so the same browser keeps one token.
-                            localStorage.setItem("smartqr_device_token", token);
-                            document.cookie = "smartqr_device_token=" + encodeURIComponent(token) + "; path=/; max-age=31536000; SameSite=Lax";
-                            return token;
-                        }
-
-                        document.getElementById("device_id").value = getDeviceToken();
-                    </script>
-
-                </div>
-
-            </body>
-
-            </html>
-        """,
-        name=student[1],
-        student_id=student[0],
-        date=now.strftime("%Y-%m-%d"),
-        time=now.strftime("%I:%M:%S %p")
+@app.route("/access/<token>")
+def qr_access(token):
+    if token != QR_TOKEN:
+        return page(
+            "Invalid QR",
+            "<h1>Invalid QR Code</h1>"
+            "<p>This QR code is not valid.</p>"
         )
 
+    session.pop("qr_verified", None)
+    session.pop("location_verified", None)
 
-    # --------------------------------------------------------
-    # GET ATTENDANCE PAGE
-    # --------------------------------------------------------
+    body = """
+    <h1>📍 Verify College Location</h1>
+    <p>Please allow location access to mark attendance.</p>
+    <p id="msg">Checking location...</p>
 
-    return render_template_string("""
-        <!DOCTYPE html>
+    <script>
+    function showMessage(text) {
+        document.getElementById("msg").textContent = text;
+    }
 
-        <html>
+    if (!navigator.geolocation) {
+        showMessage("Location is not supported by this browser.");
+    } else {
+        navigator.geolocation.getCurrentPosition(async p => {
+            try {
+                const response = await fetch("/verify-location", {
+                    method: "POST",
+                    headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify({
+                        latitude: p.coords.latitude,
+                        longitude: p.coords.longitude
+                    })
+                });
 
-        <head>
+                const data = await response.json();
 
-            <meta name="viewport"
-                  content="width=device-width, initial-scale=1">
-
-            <title>Mark Attendance</title>
-
-            <style>
-
-                body {
-                    font-family: Arial;
-                    background: #f4f6f8;
-                    margin: 0;
-                    padding: 30px;
+                if (data.success) {
+                    showMessage("Location verified. Opening attendance...");
+                    setTimeout(() => location.href = "/scan", 500);
+                } else {
+                    showMessage(data.message);
                 }
+            } catch (e) {
+                showMessage("Unable to verify location. Try again.");
+            }
+        }, () => {
+            showMessage("Please allow location permission.");
+        }, {enableHighAccuracy: true, timeout: 15000});
+    }
+    </script>
+    """
 
-                .box {
-                    max-width: 600px;
-                    margin: 60px auto;
-                    background: white;
-                    padding: 35px;
-                    border-radius: 15px;
-                }
-
-                h1 {
-                    text-align: center;
-                }
-
-                input {
-                    width: 100%;
-                    box-sizing: border-box;
-                    padding: 15px;
-                    font-size: 18px;
-                    margin-top: 20px;
-                    margin-bottom: 20px;
-                    border: 1px solid #aaa;
-                    border-radius: 8px;
-                }
-
-                button {
-                    width: 100%;
-                    padding: 15px;
-                    background: green;
-                    color: white;
-                    border: none;
-                    border-radius: 8px;
-                    font-size: 18px;
-                }
-
-                .back {
-                    display: block;
-                    text-align: center;
-                    margin-top: 20px;
-                    color: #333;
-                }
-
-            </style>
-
-        </head>
-
-        <body>
-
-            <div class="box">
-
-                <h1>
-                    📱 Smart QR Attendance
-                </h1>
-
-                <p style="text-align:center;">
-                    Enter your Register Number
-                </p>
-
-                <form method="POST">
-
-                    <input
-                        type="text"
-                        name="student_id"
-                        placeholder="Enter Register Number"
-                        required
-                        autocomplete="off"
-                    >
-
-                    <button type="submit">
-                        🔍 Check Details
-                    </button>
-
-                </form>
-
-                <a
-                    href="/"
-                    class="back"
-                >
-                    ← Back to Home
-                </a>
-
-            </div>
-
-        </body>
-
-        </html>
-    """)
+    return page("Verify Location", body)
 
 
-# ============================================================
-# MONTHLY ATTENDANCE
-# ============================================================
+@app.route("/verify-location", methods=["POST"])
+def verify_location():
+    data = request.get_json(silent=True) or {}
 
-@app.route(
-    "/monthly",
-    methods=["GET", "POST"]
-)
-def monthly():
+    if inside_college(
+        data.get("latitude"), data.get("longitude")
+    ):
+        session["location_verified"] = True
+        session["qr_verified"] = True
 
-    # --------------------------------------------------------
-    # SECURITY
-    # --------------------------------------------------------
+        return jsonify(success=True)
 
+    session.pop("location_verified", None)
+    session.pop("qr_verified", None)
+
+    return jsonify(
+        success=False,
+        message="Attendance is allowed only within 500 metres of college."
+    )
+
+
+def active_session():
+    now = datetime.now().strftime("%H:%M")
+
+    if MORNING_START <= now <= MORNING_END:
+        return "morning"
+
+    if AFTERNOON_START <= now <= AFTERNOON_END:
+        return "afternoon"
+
+    return None
+
+
+# --------------------------------------------------
+# STUDENT ATTENDANCE
+# --------------------------------------------------
+
+@app.route("/scan", methods=["GET", "POST"])
+def scan():
     if not qr_required():
+        return page(
+            "Access Denied",
+            "<h1>🔒 Access Denied</h1>"
+            "<p>Scan the official QR and verify your location first.</p>"
+        )
 
-        return render_template_string("""
-            <html>
-
-            <body style="
-                font-family:Arial;
-                text-align:center;
-                margin-top:100px;
-            ">
-
-            <h1 style="color:red;">
-                🔒 Access Denied
-            </h1>
-
-            <p>
-                Please scan the Attendance QR Code
-                from inside the college first.
-            </p>
-
-            </body>
-
-            </html>
-        """)
-
-
-    result = None
-    error = None
-
-
-    # --------------------------------------------------------
-    # POST
-    # --------------------------------------------------------
+    message = ""
 
     if request.method == "POST":
+        sid = (request.form.get("student_id") or "").strip()
+        sess = active_session()
 
-        student_id = request.form.get(
-            "student_id",
-            ""
-        ).strip()
+        conn = db()
 
-        month = request.form.get(
-            "month",
-            ""
-        )
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT student_id, name
+                    FROM students WHERE student_id = %s
+                """, (sid,))
+                student = cur.fetchone()
 
-        working_days = request.form.get(
-            "working_days",
-            ""
-        ).strip()
+                if not student:
+                    message = "Register number not found."
 
-
-        if (
-            not student_id
-            or not month
-            or not working_days
-        ):
-
-            error = "Please enter all details."
-
-        else:
-
-            try:
-
-                working_days = int(
-                    working_days
-                )
-
-                if working_days <= 0:
-
-                    error = (
-                        "Working days must be greater than 0."
+                elif not sess:
+                    message = (
+                        f"Attendance time is closed. Morning: "
+                        f"{MORNING_START}-{MORNING_END}; Afternoon: "
+                        f"{AFTERNOON_START}-{AFTERNOON_END}."
                     )
+
+                elif request.form.get("confirm") == "yes":
+                    device = (
+                        request.form.get("device_id") or ""
+                    ).strip()
+
+                    if len(device) < 20:
+                        message = "Device verification failed. Refresh and retry."
+                    else:
+                        today = date.today().isoformat()
+                        now = datetime.now().strftime("%I:%M:%S %p")
+
+                        cur.execute("""
+                            SELECT id FROM attendance
+                            WHERE student_id = %s
+                              AND date = %s
+                              AND session_name = %s
+                        """, (sid, today, sess))
+
+                        if cur.fetchone():
+                            message = "This student has already marked this session."
+
+                        else:
+                            cur.execute("""
+                                SELECT student_id FROM attendance
+                                WHERE device_id = %s
+                                  AND date = %s
+                                  AND session_name = %s
+                                  AND session_name <> 'legacy_full'
+                            """, (device, today, sess))
+
+                            if cur.fetchone():
+                                message = "This device has already been used for this session."
+
+                            else:
+                                cur.execute("""
+                                    INSERT INTO attendance
+                                    (student_id, date, time, device_id,
+                                     session_name, status, marked_by)
+                                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                                """, (
+                                    sid, today, now, device,
+                                    sess, "Present", "QR"
+                                ))
+
+                                conn.commit()
+
+                                return page(
+                                    "Attendance Submitted",
+                                    f"<h1>✅ Attendance Submitted</h1>"
+                                    f"<p>Name: {student['name']}</p>"
+                                    f"<p>Register No: {sid}</p>"
+                                    f"<p>Date: {today}</p>"
+                                    f"<p>Time: {now}</p>"
+                                    f"<p>Session: {sess.title()}</p>"
+                                    f'<a class="btn" href="/">Home</a>'
+                                )
 
                 else:
+                    body = """
+                    <h1>Confirm Attendance</h1>
+                    <p>Name: {{ student.name }}</p>
+                    <p>Register Number: {{ student.student_id }}</p>
+                    <p>Session: {{ sess.title() }}</p>
 
-                    conn = connect_db()
-                    cursor = conn.cursor()
+                    <form method="post">
+                        <input type="hidden" name="student_id"
+                               value="{{ student.student_id }}">
+                        <input type="hidden" name="confirm" value="yes">
+                        <input type="hidden" name="device_id" id="dev">
+                        <button>Confirm Attendance</button>
+                    </form>
 
-                    cursor.execute(
-                        """
-                        SELECT student_id, name
-                        FROM students
-                        WHERE student_id = %s
-                        """,
-                        (student_id,)
+                    <script>
+                    let key = "smartqr_device_token";
+                    let token = localStorage.getItem(key);
+
+                    if (!token) {
+                        token = crypto.randomUUID
+                            ? crypto.randomUUID()
+                            : "dev-" + Date.now() + "-" +
+                              Math.random().toString(36).slice(2) +
+                              Math.random().toString(36).slice(2);
+
+                        localStorage.setItem(key, token);
+                    }
+
+                    document.getElementById("dev").value = token;
+                    </script>
+                    """
+
+                    return page(
+                        "Confirm Attendance",
+                        body, student=student, sess=sess
                     )
 
-                    student = cursor.fetchone()
+        except psycopg2.errors.UniqueViolation:
+            conn.rollback()
+            message = "Attendance already exists for this session."
 
+        finally:
+            conn.close()
+
+    body = """
+    <h1>📱 Student Attendance</h1>
+
+    {% if message %}
+    <p class="msg err">{{ message }}</p>
+    {% endif %}
+
+    <p>Morning: {{ ms }}–{{ me }}</p>
+    <p>Afternoon: {{ astart }}–{{ aend }}</p>
+
+    <form method="post">
+        <label>Register Number</label><br>
+        <input name="student_id" required autocomplete="off">
+        <br><button>Check Details</button>
+    </form>
+
+    <a class="btn" href="/">Home</a>
+    """
+
+    return page(
+        "Student Attendance", body,
+        message=message,
+        ms=MORNING_START, me=MORNING_END,
+        astart=AFTERNOON_START, aend=AFTERNOON_END
+    )
+
+
+# --------------------------------------------------
+# ADMIN LOGIN / LOGOUT
+# --------------------------------------------------
+
+@app.route("/admin/login", methods=["GET", "POST"])
+def admin_login():
+    error = ""
+
+    if request.method == "POST":
+        username = (request.form.get("username") or "").strip()
+        password = request.form.get("password") or ""
+
+        if username in ADMINS and password == ADMINS[username]:
+            session.clear()
+            session["admin_user"] = username
+            return redirect(url_for("admin_dashboard"))
+
+        error = "Invalid admin username or password."
+
+    body = """
+    <h1>🔐 Admin Login</h1>
+    {% if error %}<p class="msg err">{{ error }}</p>{% endif %}
+
+    <form method="post">
+        <label>Username</label><br>
+        <input name="username" required><br>
+        <label>Password</label><br>
+        <input name="password" type="password" required><br>
+        <button>Login</button>
+    </form>
+    <a class="btn" href="/">Home</a>
+    """
+
+    return page("Admin Login", body, error=error)
+
+
+@app.route("/admin/logout")
+def admin_logout():
+    session.clear()
+    return redirect(url_for("admin_login"))
+
+
+# --------------------------------------------------
+# ADMIN DATABASE DASHBOARD
+# --------------------------------------------------
+
+@app.route("/admin")
+@admin_required
+def admin_dashboard():
+    conn = db()
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS n FROM students")
+            total = cur.fetchone()["n"]
+
+            cur.execute("""
+                SELECT a.student_id,
+                       COALESCE(s.name, 'Unknown') AS name,
+                       a.date, a.time, a.session_name, a.status,
+                       a.marked_by, a.reason
+                FROM attendance a
+                LEFT JOIN students s
+                  ON s.student_id = a.student_id
+                ORDER BY a.date DESC, a.time DESC
+                LIMIT 300
+            """)
+            records = cur.fetchall()
+
+            cur.execute("""
+                SELECT student_id, name, parent_phone
+                FROM students ORDER BY student_id
+            """)
+            students = cur.fetchall()
+
+    finally:
+        conn.close()
+
+    body = """
+    <h1>Admin Dashboard</h1>
+    <p>Logged in as <b>{{ user }}</b></p>
+    <p>Total Students: <b>{{ total }}</b></p>
+
+    <div class="nav">
+        <a class="btn" href="/admin/report">Attendance Percentage Report</a>
+        <a class="btn" href="/admin/manual">Manual Attendance</a>
+        <a class="btn" href="/admin/logout">Logout</a>
+    </div>
+
+    <h2>Student Database</h2>
+    <table>
+    <tr><th>Register No</th><th>Name</th><th>Parent Phone</th></tr>
+    {% for s in students %}
+    <tr>
+        <td>{{ s.student_id }}</td>
+        <td>{{ s.name }}</td>
+        <td>{{ s.parent_phone or '—' }}</td>
+    </tr>
+    {% endfor %}
+    </table>
+
+    <h2>Recent Attendance Records</h2>
+    <table>
+    <tr>
+        <th>Register No</th><th>Name</th><th>Date</th><th>Time</th>
+        <th>Session</th><th>Status</th><th>Marked By</th><th>Reason</th>
+    </tr>
+    {% for r in records %}
+    <tr>
+        <td>{{ r.student_id }}</td><td>{{ r.name }}</td>
+        <td>{{ r.date }}</td><td>{{ r.time }}</td>
+        <td>{{ r.session_name }}</td><td>{{ r.status }}</td>
+        <td>{{ r.marked_by }}</td><td>{{ r.reason or '—' }}</td>
+    </tr>
+    {% endfor %}
+    </table>
+    """
+
+    return page(
+        "Admin Dashboard", body,
+        user=session["admin_user"], total=total,
+        records=records, students=students
+    )
+
+
+# --------------------------------------------------
+# ADMIN MANUAL ATTENDANCE
+# --------------------------------------------------
+
+@app.route("/admin/manual", methods=["GET", "POST"])
+@admin_required
+def manual_attendance():
+    message = ""
+    error = ""
+
+    if request.method == "POST":
+        sid = (request.form.get("student_id") or "").strip()
+        sess = (request.form.get("session_name") or "").strip().lower()
+        reason = (request.form.get("reason") or "").strip()
+
+        if sess not in ("morning", "afternoon") or not reason:
+            error = "Select a session and enter a reason."
+
+        else:
+            conn = db()
+
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT name FROM students WHERE student_id = %s
+                    """, (sid,))
+                    student = cur.fetchone()
 
                     if not student:
-
-                        error = (
-                            "❌ Register number not found."
-                        )
+                        error = "Student register number not found."
 
                     else:
+                        today = date.today().isoformat()
+                        now = datetime.now().strftime("%I:%M:%S %p")
 
-                        cursor.execute(
-                            """
-                            SELECT COUNT(DISTINCT date)
-                            FROM attendance
+                        cur.execute("""
+                            SELECT id FROM attendance
                             WHERE student_id = %s
-                            AND substr(date, 1, 7) = %s
-                            """,
-                            (
-                                student_id,
-                                month
-                            )
-                        )
+                              AND date = %s
+                              AND session_name = %s
+                        """, (sid, today, sess))
 
-                        present_days = (
-                            cursor.fetchone()[0]
-                        )
+                        if cur.fetchone():
+                            error = "Attendance already exists for this session."
 
-
-                        absent_days = (
-                            working_days -
-                            present_days
-                        )
-
-                        if absent_days < 0:
-                            absent_days = 0
-
-
-                        percentage = (
-                            present_days /
-                            working_days
-                        ) * 100
-
-                        # Attendance warning levels
-                        if percentage <= 75:
-                            attendance_alert = "🚨 LOW ATTENDANCE ALERT: Your attendance is 75% or below. Please improve your attendance."
-                            alert_type = "low"
-                        elif percentage < 80:
-                            attendance_alert = "⚠️ WARNING: Your attendance is below 80%. Please improve your attendance."
-                            alert_type = "warning"
                         else:
-                            attendance_alert = "✅ GOOD ATTENDANCE: Your attendance is 80% or above."
-                            alert_type = "good"
-
-
-                        result = {
-
-                            "student_id":
-                                student[0],
-
-                            "name":
-                                student[1],
-
-                            "month":
-                                month,
-
-                            "working_days":
-                                working_days,
-
-                            "present_days":
-                                present_days,
-
-                            "absent_days":
-                                absent_days,
-
-                            "percentage":
-                                round(
-                                    percentage,
-                                    2
-                                ),
-
-                            "alert": attendance_alert,
-                            "alert_type": alert_type
-                        }
-
-
-                    conn.close()
-
-
-            except ValueError:
-
-                error = (
-                    "Working days must be a number."
-                )
-
-
-    # --------------------------------------------------------
-    # MONTHLY HTML
-    # --------------------------------------------------------
-
-    html = """
-    <!DOCTYPE html>
-
-    <html>
-
-    <head>
-
-        <meta name="viewport"
-              content="width=device-width, initial-scale=1">
-
-        <title>Monthly Attendance</title>
-
-        <style>
-
-            body {
-                font-family: Arial;
-                background: #f4f6f8;
-                margin: 0;
-                padding: 30px;
-            }
-
-            .box {
-                max-width: 650px;
-                margin: 30px auto;
-                background: white;
-                padding: 35px;
-                border-radius: 15px;
-            }
-
-            h1 {
-                text-align: center;
-            }
-
-            label {
-                display: block;
-                margin-top: 18px;
-                margin-bottom: 7px;
-                font-weight: bold;
-            }
-
-            input {
-                width: 100%;
-                box-sizing: border-box;
-                padding: 14px;
-                font-size: 16px;
-                border: 1px solid #aaa;
-                border-radius: 7px;
-            }
-
-            button {
-                width: 100%;
-                padding: 15px;
-                margin-top: 25px;
-                background: green;
-                color: white;
-                border: none;
-                border-radius: 8px;
-                font-size: 18px;
-            }
-
-            .error {
-                background: #ffe6e6;
-                color: red;
-                padding: 15px;
-                border-radius: 8px;
-                margin-top: 20px;
-                text-align: center;
-            }
-
-            .result {
-                margin-top: 30px;
-                padding: 25px;
-                background: #f0fff0;
-                border-radius: 12px;
-            }
-
-            .row {
-                padding: 12px 0;
-                border-bottom: 1px solid #ddd;
-                font-size: 17px;
-            }
-
-            .percentage {
-                margin-top: 20px;
-                padding: 20px;
-                background: green;
-                color: white;
-                text-align: center;
-                border-radius: 10px;
-                font-size: 28px;
-                font-weight: bold;
-            }
-
-            .alert {
-                margin-top: 20px;
-                padding: 16px;
-                border-radius: 10px;
-                text-align: center;
-                font-size: 16px;
-                font-weight: bold;
-            }
-
-            .alert.good { background: #e8f7e8; color: #176b2c; }
-            .alert.warning { background: #fff4cc; color: #8a5a00; }
-            .alert.low { background: #ffe0e0; color: #a00000; }
-
-            .back {
-                display: block;
-                text-align: center;
-                margin-top: 20px;
-                color: #222;
-                text-decoration: none;
-            }
-
-        </style>
-
-    </head>
-
-    <body>
-
-        <div class="box">
-
-            <h1>
-                📊 Monthly Attendance
-            </h1>
-
-            <p style="text-align:center;">
-                Check one student's monthly
-                attendance percentage.
-            </p>
-
-
-            <form method="POST">
-
-                <label>
-                    🆔 Register Number
-                </label>
-
-                <input
-                    type="text"
-                    name="student_id"
-                    placeholder="Enter Register Number"
-                    required
-                >
-
-
-                <label>
-                    📅 Select Month
-                </label>
-
-                <input
-                    type="month"
-                    name="month"
-                    required
-                >
-
-
-                <label>
-                    🏫 Total Working Days
-                </label>
-
-                <input
-                    type="number"
-                    name="working_days"
-                    placeholder="Example: 20"
-                    min="1"
-                    required
-                >
-
-
-                <button type="submit">
-                    📊 Calculate Attendance
-                </button>
-
-            </form>
-
-
-            {% if error %}
-
-            <div class="error">
-                {{ error }}
-            </div>
-
-            {% endif %}
-
-
-            {% if result %}
-
-            <div class="result">
-
-                <h2 style="text-align:center;">
-                    👤 Student Details
-                </h2>
-
-                <div class="row">
-                    <b>Name:</b>
-                    {{ result.name }}
-                </div>
-
-                <div class="row">
-                    <b>Register Number:</b>
-                    {{ result.student_id }}
-                </div>
-
-                <div class="row">
-                    <b>Month:</b>
-                    {{ result.month }}
-                </div>
-
-                <div class="row">
-                    <b>Total Working Days:</b>
-                    {{ result.working_days }}
-                </div>
-
-                <div class="row">
-                    <b>Present Days:</b>
-                    {{ result.present_days }}
-                </div>
-
-                <div class="row">
-                    <b>Absent Days:</b>
-                    {{ result.absent_days }}
-                </div>
-
-                <div class="percentage">
-
-                    📊 {{ result.percentage }}%
-
-                    <div style="
-                        font-size:15px;
-                        margin-top:8px;
-                        font-weight:normal;
-                    ">
-
-                        Attendance Percentage
-
-                    </div>
-
-                </div>
-
-                <div class="alert {{ result.alert_type }}">
-                    {{ result.alert }}
-                </div>
-
-            </div>
-
-            {% endif %}
-
-
-            <a
-                href="/"
-                class="back"
-            >
-                ← Back to Home
-            </a>
-
-        </div>
-
-    </body>
-
-    </html>
+                            cur.execute("""
+                                INSERT INTO attendance
+                                (student_id, date, time, device_id,
+                                 session_name, status, marked_by, reason)
+                                VALUES (%s, %s, %s, NULL, %s, %s, %s, %s)
+                            """, (
+                                sid, today, now, sess, "Present",
+                                session["admin_user"], reason
+                            ))
+
+                            conn.commit()
+                            message = (
+                                f"Attendance marked for {student['name']} "
+                                f"({sid}) — {sess.title()}."
+                            )
+
+            finally:
+                conn.close()
+
+    body = """
+    <h1>Admin Manual Attendance</h1>
+    <p>Admin location verification is not required. Reason is mandatory.</p>
+
+    {% if message %}<p class="msg">{{ message }}</p>{% endif %}
+    {% if error %}<p class="msg err">{{ error }}</p>{% endif %}
+
+    <form method="post">
+        <label>Register Number</label><br>
+        <input name="student_id" required><br>
+
+        <label>Session</label><br>
+        <select name="session_name" required>
+            <option value="">Select session</option>
+            <option value="morning">Morning</option>
+            <option value="afternoon">Afternoon</option>
+        </select><br>
+
+        <label>Reason</label><br>
+        <input name="reason" required placeholder="QR issue / network issue"><br>
+
+        <button>Mark Attendance</button>
+    </form>
+
+    <a class="btn" href="/admin">Back to Dashboard</a>
     """
 
-
-    return render_template_string(
-        html,
-        result=result,
-        error=error
+    return page(
+        "Manual Attendance", body,
+        message=message, error=error
     )
 
 
-# ============================================================
-# ATTENDANCE RECORDS
-# ============================================================
+# --------------------------------------------------
+# ALL-STUDENT DATE-RANGE PERCENTAGE REPORT
+# --------------------------------------------------
+
+@app.route("/admin/report", methods=["GET", "POST"])
+@admin_required
+def attendance_report():
+    report = []
+    error = ""
+    start = ""
+    end = ""
+    working = ""
+
+    if request.method == "POST":
+        start = request.form.get("from_date", "")
+        end = request.form.get("to_date", "")
+        working = request.form.get("working_days", "")
+
+        try:
+            date_from = date.fromisoformat(start)
+            date_to = date.fromisoformat(end)
+            working_days = int(working)
+
+            if date_to < date_from:
+                raise ValueError("To Date must be on or after From Date.")
+
+            if working_days <= 0:
+                raise ValueError("Working days must be greater than zero.")
+
+            conn = db()
+
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT student_id, name
+                        FROM students ORDER BY student_id
+                    """)
+                    students = cur.fetchall()
+
+                    cur.execute("""
+                        SELECT student_id, date, session_name, status
+                        FROM attendance
+                        WHERE date >= %s AND date <= %s
+                        ORDER BY student_id, date
+                    """, (start, end))
+                    rows = cur.fetchall()
+
+                counts = {
+                    s["student_id"]: {
+                        "morning": set(),
+                        "afternoon": set(),
+                        "legacy": set()
+                    }
+                    for s in students
+                }
+
+                for row in rows:
+                    sid = row["student_id"]
+
+                    if sid not in counts or row["status"] != "Present":
+                        continue
+
+                    day = row["date"]
+                    kind = row["session_name"]
+
+                    if kind == "legacy_full":
+                        counts[sid]["legacy"].add(day)
+                    elif kind == "morning":
+                        counts[sid]["morning"].add(day)
+                    elif kind == "afternoon":
+                        counts[sid]["afternoon"].add(day)
+
+                for student in students:
+                    c = counts[student["student_id"]]
+
+                    full_dates = (
+                        c["legacy"]
+                        | (c["morning"] & c["afternoon"])
+                    )
+
+                    half_dates = (
+                        c["morning"] ^ c["afternoon"]
+                    ) - full_dates
+
+                    full = len(full_dates)
+                    half = len(half_dates)
+                    absent = max(0, working_days - full - half)
+
+                    percentage = round(
+                        ((full + half * 0.5) / working_days) * 100,
+                        2
+                    )
+
+                    report.append({
+                        "student_id": student["student_id"],
+                        "name": student["name"],
+                        "full": full,
+                        "half": half,
+                        "absent": absent,
+                        "percentage": percentage
+                    })
+
+            finally:
+                conn.close()
+
+        except (ValueError, TypeError):
+            error = "Enter valid dates and working days."
+
+    body = """
+    <h1>Attendance Percentage Report</h1>
+
+    <form method="post">
+        <label>From Date</label><br>
+        <input type="date" name="from_date" value="{{ start }}" required><br>
+
+        <label>To Date</label><br>
+        <input type="date" name="to_date" value="{{ end }}" required><br>
+
+        <label>Total Working Days</label><br>
+        <input type="number" min="1" name="working_days"
+               value="{{ working }}" required><br>
+
+        <button>Calculate All Students</button>
+    </form>
+
+    {% if error %}<p class="msg err">{{ error }}</p>{% endif %}
+
+    {% if report %}
+    <h2>Report: {{ start }} to {{ end }}</h2>
+
+    <table>
+    <tr>
+        <th>Register No</th>
+        <th>Full Days</th>
+        <th>Half Days</th>
+        <th>Absent Days</th>
+        <th>Percentage</th>
+    </tr>
+    {% for r in report %}
+    <tr>
+        <td>{{ r.student_id }}</td>
+        <td>{{ r.full }}</td>
+        <td>{{ r.half }}</td>
+        <td>{{ r.absent }}</td>
+        <td>{{ r.percentage }}%</td>
+    </tr>
+    {% endfor %}
+    </table>
+    {% endif %}
+
+    <p>Full day = 1; half day = 0.5.</p>
+    <p>Percentage = (Full Days + Half Days × 0.5)
+       ÷ Total Working Days × 100.</p>
+
+    <a class="btn" href="/admin">Back to Dashboard</a>
+    """
+
+    return page(
+        "Attendance Percentage Report", body,
+        report=report, error=error,
+        start=start, end=end, working=working
+    )
+
 
 @app.route("/attendance")
-def attendance():
+@admin_required
+def attendance_redirect():
+    return redirect(url_for("admin_dashboard"))
 
-    # --------------------------------------------------------
-    # SECURITY
-    # --------------------------------------------------------
 
-    if not qr_required():
+@app.route("/monthly")
+def monthly_redirect():
+    return redirect(url_for("admin_login"))
 
-        return render_template_string("""
-            <html>
 
-            <body style="
-                font-family:Arial;
-                text-align:center;
-                margin-top:100px;
-            ">
-
-            <h1 style="color:red;">
-                🔒 Access Denied
-            </h1>
-
-            <p>
-                Please scan the Attendance QR Code
-                from inside the college first.
-            </p>
-
-            </body>
-
-            </html>
-        """)
-
-
-    # --------------------------------------------------------
-    # GET ATTENDANCE
-    # --------------------------------------------------------
-
-    conn = connect_db()
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        SELECT
-            attendance.student_id,
-            students.name,
-            attendance.date,
-            attendance.time
-        FROM attendance
-
-        LEFT JOIN students
-        ON attendance.student_id =
-           students.student_id
-
-        ORDER BY
-            attendance.date DESC,
-            attendance.time DESC
-    """)
-
-    records = cursor.fetchall()
-
-    conn.close()
-
-
-    # --------------------------------------------------------
-    # HTML
-    # --------------------------------------------------------
-
-    html = """
-    <!DOCTYPE html>
-
-    <html>
-
-    <head>
-
-        <meta name="viewport"
-              content="width=device-width, initial-scale=1">
-
-        <title>Attendance Records</title>
-
-        <style>
-
-            body {
-                font-family: Arial;
-                margin: 30px;
-                background: #f4f6f8;
-            }
-
-            table {
-                width: 100%;
-                border-collapse: collapse;
-                background: white;
-            }
-
-            th {
-                background: #222;
-                color: white;
-            }
-
-            th, td {
-                padding: 12px;
-                border: 1px solid #ddd;
-                text-align: left;
-            }
-
-            a {
-                display: inline-block;
-                margin-top: 20px;
-                padding: 12px 20px;
-                background: #222;
-                color: white;
-                text-decoration: none;
-                border-radius: 6px;
-            }
-
-            @media(max-width:600px) {
-
-                body {
-                    margin: 10px;
-                }
-
-                table {
-                    font-size: 12px;
-                }
-
-                th, td {
-                    padding: 7px;
-                }
-
-            }
-
-        </style>
-
-    </head>
-
-    <body>
-
-        <h1>
-            📊 Attendance Records
-        </h1>
-
-        <table>
-
-            <tr>
-
-                <th>
-                    Register Number
-                </th>
-
-                <th>
-                    Name
-                </th>
-
-                <th>
-                    Date
-                </th>
-
-                <th>
-                    Time
-                </th>
-
-            </tr>
-
-
-            {% for record in records %}
-
-            <tr>
-
-                <td>
-                    {{ record[0] }}
-                </td>
-
-                <td>
-                    {{ record[1] }}
-                </td>
-
-                <td>
-                    {{ record[2] }}
-                </td>
-
-                <td>
-                    {{ record[3] }}
-                </td>
-
-            </tr>
-
-            {% endfor %}
-
-        </table>
-
-
-        <a href="/">
-            ← Back to Students
-        </a>
-
-    </body>
-
-    </html>
-    """
-
-
-    return render_template_string(
-        html,
-        records=records
-    )
-
-
-# ============================================================
-# START APPLICATION
-# ============================================================
-
-# Gunicorn imports this module instead of running it as __main__.
-# Initialize the SQLite database and import students during module load.
-create_tables()
+# Initialize database and import CSV student records.
+# Existing attendance rows are retained.
+init_db()
 import_students()
 
+
 if __name__ == "__main__":
-
-    print(
-        "Starting Smart QR Attendance..."
-    )
-
-    print(
-        "Application started successfully!"
-    )
-
-    print(
-        "QR Token:",
-        QR_TOKEN
-    )
-
     app.run(
         host="0.0.0.0",
-        port=5000,
-        debug=True
+        port=int(os.environ.get("PORT", "5000")),
+        debug=False
     )
