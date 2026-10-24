@@ -3,11 +3,11 @@ import os
 import csv
 import math
 from datetime import datetime, date
+from zoneinfo import ZoneInfo
 from functools import wraps
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
-
 from flask import (
     Flask, request, session, redirect,
     url_for, render_template_string, jsonify
@@ -18,6 +18,8 @@ app.secret_key = os.environ.get(
     "FLASK_SECRET_KEY", "change-this-secret-key"
 )
 
+IST = ZoneInfo("Asia/Kolkata")
+
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 CSV_FILE = "students.csv"
 QR_TOKEN = os.environ.get("QR_TOKEN", "SMARTQR2026")
@@ -26,7 +28,6 @@ COLLEGE_LAT = float(os.environ.get("COLLEGE_LAT", "11.067294"))
 COLLEGE_LON = float(os.environ.get("COLLEGE_LON", "77.083478"))
 ALLOWED_RADIUS = 100
 
-# Change these times to match your college timetable.
 MORNING_START = os.environ.get("MORNING_START", "09:00")
 MORNING_END = os.environ.get("MORNING_END", "09:30")
 AFTERNOON_START = os.environ.get("AFTERNOON_START", "13:20")
@@ -45,6 +46,10 @@ if not DATABASE_URL:
     )
 
 
+def now_ist():
+    return datetime.now(IST)
+
+
 def db():
     return psycopg2.connect(
         DATABASE_URL,
@@ -53,7 +58,7 @@ def db():
 
 
 # --------------------------------------------------
-# DATABASE SETUP AND SAFE ADDITIVE MIGRATION
+# DATABASE SETUP - PRESERVE EXISTING RECORDS
 # --------------------------------------------------
 
 def init_db():
@@ -108,8 +113,6 @@ def init_db():
                 ADD COLUMN IF NOT EXISTS reason TEXT
             """)
 
-            # Keep historical records and classify old daily
-            # records separately from the new session records.
             cur.execute("""
                 UPDATE attendance
                 SET session_name = 'legacy_full'
@@ -128,13 +131,13 @@ def init_db():
                 WHERE marked_by IS NULL OR marked_by = ''
             """)
 
-            # Allow separate morning and afternoon attendance.
-            cur.execute(
-                "DROP INDEX IF EXISTS idx_attendance_student_date"
-            )
-            cur.execute(
-                "DROP INDEX IF EXISTS idx_attendance_device_date"
-            )
+            cur.execute("""
+                DROP INDEX IF EXISTS idx_attendance_student_date
+            """)
+
+            cur.execute("""
+                DROP INDEX IF EXISTS idx_attendance_device_date
+            """)
 
             cur.execute("""
                 CREATE UNIQUE INDEX IF NOT EXISTS
@@ -166,10 +169,7 @@ def import_students():
     try:
         with conn.cursor() as cur:
             with open(
-                CSV_FILE,
-                "r",
-                encoding="utf-8-sig",
-                newline=""
+                CSV_FILE, "r", encoding="utf-8-sig", newline=""
             ) as file:
                 reader = csv.DictReader(file)
 
@@ -206,7 +206,7 @@ def import_students():
 
 
 # --------------------------------------------------
-# LOCATION VERIFICATION
+# COLLEGE LOCATION VERIFICATION
 # --------------------------------------------------
 
 def inside_college(latitude, longitude):
@@ -217,7 +217,6 @@ def inside_college(latitude, longitude):
         return False
 
     radius = 6371000
-
     lat1 = math.radians(COLLEGE_LAT)
     lat2 = math.radians(latitude)
     dlat = math.radians(latitude - COLLEGE_LAT)
@@ -225,8 +224,7 @@ def inside_college(latitude, longitude):
 
     a = (
         math.sin(dlat / 2) ** 2
-        + math.cos(lat1)
-        * math.cos(lat2)
+        + math.cos(lat1) * math.cos(lat2)
         * math.sin(dlon / 2) ** 2
     )
 
@@ -246,6 +244,30 @@ def qr_required():
 
 
 # --------------------------------------------------
+# ATTENDANCE SESSION - ALWAYS USE INDIA TIME
+# --------------------------------------------------
+
+def active_session():
+    now = now_ist().strftime("%H:%M")
+
+    if MORNING_START <= now <= MORNING_END:
+        return "morning"
+
+    if AFTERNOON_START <= now <= AFTERNOON_END:
+        return "afternoon"
+
+    return None
+
+
+def current_date():
+    return now_ist().date().isoformat()
+
+
+def current_time():
+    return now_ist().strftime("%I:%M:%S %p")
+
+
+# --------------------------------------------------
 # ADMIN AUTHENTICATION
 # --------------------------------------------------
 
@@ -254,9 +276,7 @@ def admin_required(function):
     def wrapper(*args, **kwargs):
         if not session.get("admin_user"):
             return redirect(url_for("admin_login"))
-
         return function(*args, **kwargs)
-
     return wrapper
 
 
@@ -272,7 +292,7 @@ BASE = """
 <title>{{ title }}</title>
 <style>
 body {
-    font-family: Arial;
+    font-family: Arial, sans-serif;
     background: #f3f5f8;
     margin: 0;
     padding: 20px;
@@ -307,6 +327,13 @@ button, .btn {
     cursor: pointer;
     display: inline-block;
 }
+.submit-btn {
+    background: #176b38;
+    width: 100%;
+    margin-top: 12px;
+    font-weight: bold;
+    padding: 14px;
+}
 table {
     border-collapse: collapse;
     width: 100%;
@@ -338,8 +365,17 @@ th {
     flex-wrap: wrap;
     margin: 15px 0;
 }
+label {
+    display: inline-block;
+    margin-top: 8px;
+}
 @media(max-width:650px) {
-    .card { padding: 13px; margin: 8px auto; overflow-x: auto; }
+    body { padding: 8px; }
+    .card {
+        padding: 13px;
+        margin: 8px auto;
+        overflow-x: auto;
+    }
     table { font-size: 12px; }
     th, td { padding: 7px; }
 }
@@ -354,9 +390,7 @@ th {
 
 def page(title, body, **context):
     rendered = render_template_string(body, **context)
-    return render_template_string(
-        BASE, title=title, body=rendered
-    )
+    return render_template_string(BASE, title=title, body=rendered)
 
 
 # --------------------------------------------------
@@ -391,7 +425,10 @@ def home():
     <table>
     <tr><th>Register Number</th><th>Name</th></tr>
     {% for s in students %}
-    <tr><td>{{ s.student_id }}</td><td>{{ s.name }}</td></tr>
+    <tr>
+        <td>{{ s.student_id }}</td>
+        <td>{{ s.name }}</td>
+    </tr>
     {% endfor %}
     </table>
     """
@@ -469,7 +506,6 @@ def verify_location():
     ):
         session["location_verified"] = True
         session["qr_verified"] = True
-
         return jsonify(success=True)
 
     session.pop("location_verified", None)
@@ -477,24 +513,12 @@ def verify_location():
 
     return jsonify(
         success=False,
-        message="Attendance is allowed only within 500 metres of college."
+        message="Attendance is allowed only within 100 metres of college."
     )
 
 
-def active_session():
-    now = datetime.now().strftime("%H:%M")
-
-    if MORNING_START <= now <= MORNING_END:
-        return "morning"
-
-    if AFTERNOON_START <= now <= AFTERNOON_END:
-        return "afternoon"
-
-    return None
-
-
 # --------------------------------------------------
-# STUDENT ATTENDANCE
+# STUDENT ATTENDANCE - VISIBLE SUBMIT BUTTON
 # --------------------------------------------------
 
 @app.route("/scan", methods=["GET", "POST"])
@@ -503,45 +527,53 @@ def scan():
         return page(
             "Access Denied",
             "<h1>🔒 Access Denied</h1>"
-            "<p>Scan the official QR and verify your location first.</p>"
+            "<p>Scan the official QR and verify your college location first.</p>"
         )
 
     message = ""
+    success = False
 
     if request.method == "POST":
         sid = (request.form.get("student_id") or "").strip()
-        sess = active_session()
+        device = (request.form.get("device_id") or "").strip()
 
-        conn = db()
+        if not sid:
+            message = "Please enter your register number."
 
-        try:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT student_id, name
-                    FROM students WHERE student_id = %s
-                """, (sid,))
-                student = cur.fetchone()
+        elif len(device) < 20:
+            message = (
+                "Device verification is not ready. "
+                "Refresh the page and try again."
+            )
 
-                if not student:
-                    message = "Register number not found."
+        else:
+            sess = active_session()
 
-                elif not sess:
-                    message = (
-                        f"Attendance time is closed. Morning: "
-                        f"{MORNING_START}-{MORNING_END}; Afternoon: "
-                        f"{AFTERNOON_START}-{AFTERNOON_END}."
-                    )
+            conn = db()
 
-                elif request.form.get("confirm") == "yes":
-                    device = (
-                        request.form.get("device_id") or ""
-                    ).strip()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT student_id, name
+                        FROM students
+                        WHERE student_id = %s
+                    """, (sid,))
+                    student = cur.fetchone()
 
-                    if len(device) < 20:
-                        message = "Device verification failed. Refresh and retry."
+                    if not student:
+                        message = "Register number not found."
+
+                    elif not sess:
+                        message = (
+                            "Attendance time is closed. "
+                            f"Morning: {MORNING_START}-{MORNING_END}; "
+                            f"Afternoon: {AFTERNOON_START}-{AFTERNOON_END}. "
+                            "Please check the allowed time and try again."
+                        )
+
                     else:
-                        today = date.today().isoformat()
-                        now = datetime.now().strftime("%I:%M:%S %p")
+                        today = current_date()
+                        now = current_time()
 
                         cur.execute("""
                             SELECT id FROM attendance
@@ -551,7 +583,10 @@ def scan():
                         """, (sid, today, sess))
 
                         if cur.fetchone():
-                            message = "This student has already marked this session."
+                            message = (
+                                "This student has already marked "
+                                "attendance for this session."
+                            )
 
                         else:
                             cur.execute("""
@@ -563,7 +598,10 @@ def scan():
                             """, (device, today, sess))
 
                             if cur.fetchone():
-                                message = "This device has already been used for this session."
+                                message = (
+                                    "This device has already been used "
+                                    "for this session."
+                                )
 
                             else:
                                 cur.execute("""
@@ -577,87 +615,136 @@ def scan():
                                 ))
 
                                 conn.commit()
+                                success = True
 
-                                return page(
-                                    "Attendance Submitted",
-                                    f"<h1>✅ Attendance Submitted</h1>"
-                                    f"<p>Name: {student['name']}</p>"
-                                    f"<p>Register No: {sid}</p>"
-                                    f"<p>Date: {today}</p>"
-                                    f"<p>Time: {now}</p>"
-                                    f"<p>Session: {sess.title()}</p>"
-                                    f'<a class="btn" href="/">Home</a>'
-                                )
+            except psycopg2.errors.UniqueViolation:
+                conn.rollback()
+                message = (
+                    "Attendance already exists for this student, "
+                    "device, or session."
+                )
 
-                else:
-                    body = """
-                    <h1>Confirm Attendance</h1>
-                    <p>Name: {{ student.name }}</p>
-                    <p>Register Number: {{ student.student_id }}</p>
-                    <p>Session: {{ sess.title() }}</p>
+            except Exception:
+                conn.rollback()
+                app.logger.exception("Student attendance submission failed")
+                message = (
+                    "Unable to submit attendance right now. "
+                    "Please try again or contact the admin."
+                )
 
-                    <form method="post">
-                        <input type="hidden" name="student_id"
-                               value="{{ student.student_id }}">
-                        <input type="hidden" name="confirm" value="yes">
-                        <input type="hidden" name="device_id" id="dev">
-                        <button>Confirm Attendance</button>
-                    </form>
+            finally:
+                conn.close()
 
-                    <script>
-                    let key = "smartqr_device_token";
-                    let token = localStorage.getItem(key);
-
-                    if (!token) {
-                        token = crypto.randomUUID
-                            ? crypto.randomUUID()
-                            : "dev-" + Date.now() + "-" +
-                              Math.random().toString(36).slice(2) +
-                              Math.random().toString(36).slice(2);
-
-                        localStorage.setItem(key, token);
-                    }
-
-                    document.getElementById("dev").value = token;
-                    </script>
-                    """
-
-                    return page(
-                        "Confirm Attendance",
-                        body, student=student, sess=sess
-                    )
-
-        except psycopg2.errors.UniqueViolation:
-            conn.rollback()
-            message = "Attendance already exists for this session."
-
-        finally:
-            conn.close()
+            if success:
+                body = """
+                <h1>✅ Attendance Submitted Successfully</h1>
+                <p>Name: <b>{{ name }}</b></p>
+                <p>Register Number: <b>{{ sid }}</b></p>
+                <p>Date: <b>{{ today }}</b></p>
+                <p>Time: <b>{{ now }}</b></p>
+                <p>Session: <b>{{ sess }}</b></p>
+                <p>Your attendance has been saved.</p>
+                <a class="btn" href="/">Home</a>
+                """
+                return page(
+                    "Attendance Submitted",
+                    body,
+                    name=student["name"],
+                    sid=sid,
+                    today=today,
+                    now=now,
+                    sess=sess.title()
+                )
 
     body = """
     <h1>📱 Student Attendance</h1>
+    <p>Enter your register number and press Submit Attendance.</p>
 
     {% if message %}
     <p class="msg err">{{ message }}</p>
     {% endif %}
 
-    <p>Morning: {{ ms }}–{{ me }}</p>
-    <p>Afternoon: {{ astart }}–{{ aend }}</p>
+    <p><b>Morning:</b> {{ ms }}–{{ me }}</p>
+    <p><b>Afternoon:</b> {{ astart }}–{{ aend }}</p>
 
-    <form method="post">
-        <label>Register Number</label><br>
-        <input name="student_id" required autocomplete="off">
-        <br><button>Check Details</button>
+    <form method="post" id="attendanceForm">
+        <label for="student_id">Register Number</label><br>
+        <input
+            id="student_id"
+            name="student_id"
+            required
+            autocomplete="off"
+            placeholder="Enter your register number"
+            style="width:100%;"
+        >
+
+        <input type="hidden" name="device_id" id="device_id">
+
+        <button class="submit-btn" type="submit" id="submitBtn">
+            Submit Attendance
+        </button>
     </form>
 
+    <p id="deviceMsg"></p>
     <a class="btn" href="/">Home</a>
+
+    <script>
+    (function () {
+        const key = "smartqr_device_token";
+        let token = "";
+
+        try {
+            token = localStorage.getItem(key) || "";
+
+            if (!token || token.length < 20) {
+                token = (
+                    (window.crypto && crypto.randomUUID)
+                    ? crypto.randomUUID() + crypto.randomUUID()
+                    : "device-" + Date.now() + "-" +
+                      Math.random().toString(36).slice(2) +
+                      Math.random().toString(36).slice(2) +
+                      Math.random().toString(36).slice(2)
+                );
+
+                localStorage.setItem(key, token);
+            }
+
+            document.getElementById("device_id").value = token;
+        } catch (e) {
+            document.getElementById("deviceMsg").textContent =
+                "Device setup failed. Please refresh and try again.";
+            document.getElementById("submitBtn").disabled = true;
+        }
+
+        document.getElementById("attendanceForm").addEventListener(
+            "submit", function (event) {
+                const reg = document.getElementById("student_id").value.trim();
+                const device = document.getElementById("device_id").value;
+
+                if (!reg) {
+                    event.preventDefault();
+                    alert("Please enter your register number.");
+                    return;
+                }
+
+                if (!device || device.length < 20) {
+                    event.preventDefault();
+                    alert("Device verification is not ready. Refresh the page.");
+                }
+            }
+        );
+    })();
+    </script>
     """
 
     return page(
-        "Student Attendance", body,
+        "Student Attendance",
+        body,
         message=message,
-        ms=MORNING_START, me=MORNING_END,
-        astart=AFTERNOON_START, aend=AFTERNOON_END
+        ms=MORNING_START,
+        me=MORNING_END,
+        astart=AFTERNOON_START,
+        aend=AFTERNOON_END
     )
 
 
@@ -689,7 +776,7 @@ def admin_login():
         <input name="username" required><br>
         <label>Password</label><br>
         <input name="password" type="password" required><br>
-        <button>Login</button>
+        <button type="submit">Login</button>
     </form>
     <a class="btn" href="/">Home</a>
     """
@@ -704,7 +791,7 @@ def admin_logout():
 
 
 # --------------------------------------------------
-# ADMIN DATABASE DASHBOARD
+# ADMIN DASHBOARD
 # --------------------------------------------------
 
 @app.route("/admin")
@@ -770,19 +857,26 @@ def admin_dashboard():
     </tr>
     {% for r in records %}
     <tr>
-        <td>{{ r.student_id }}</td><td>{{ r.name }}</td>
-        <td>{{ r.date }}</td><td>{{ r.time }}</td>
-        <td>{{ r.session_name }}</td><td>{{ r.status }}</td>
-        <td>{{ r.marked_by }}</td><td>{{ r.reason or '—' }}</td>
+        <td>{{ r.student_id }}</td>
+        <td>{{ r.name }}</td>
+        <td>{{ r.date }}</td>
+        <td>{{ r.time }}</td>
+        <td>{{ r.session_name }}</td>
+        <td>{{ r.status }}</td>
+        <td>{{ r.marked_by }}</td>
+        <td>{{ r.reason or '—' }}</td>
     </tr>
     {% endfor %}
     </table>
     """
 
     return page(
-        "Admin Dashboard", body,
-        user=session["admin_user"], total=total,
-        records=records, students=students
+        "Admin Dashboard",
+        body,
+        user=session["admin_user"],
+        total=total,
+        records=records,
+        students=students
     )
 
 
@@ -818,8 +912,8 @@ def manual_attendance():
                         error = "Student register number not found."
 
                     else:
-                        today = date.today().isoformat()
-                        now = datetime.now().strftime("%I:%M:%S %p")
+                        today = current_date()
+                        now = current_time()
 
                         cur.execute("""
                             SELECT id FROM attendance
@@ -848,6 +942,10 @@ def manual_attendance():
                                 f"({sid}) — {sess.title()}."
                             )
 
+            except psycopg2.errors.UniqueViolation:
+                conn.rollback()
+                error = "Attendance already exists for this session."
+
             finally:
                 conn.close()
 
@@ -870,22 +968,25 @@ def manual_attendance():
         </select><br>
 
         <label>Reason</label><br>
-        <input name="reason" required placeholder="QR issue / network issue"><br>
+        <input name="reason" required
+               placeholder="QR issue / network issue"><br>
 
-        <button>Mark Attendance</button>
+        <button type="submit">Mark Attendance</button>
     </form>
 
     <a class="btn" href="/admin">Back to Dashboard</a>
     """
 
     return page(
-        "Manual Attendance", body,
-        message=message, error=error
+        "Manual Attendance",
+        body,
+        message=message,
+        error=error
     )
 
 
 # --------------------------------------------------
-# ALL-STUDENT DATE-RANGE PERCENTAGE REPORT
+# ATTENDANCE PERCENTAGE REPORT
 # --------------------------------------------------
 
 @app.route("/admin/report", methods=["GET", "POST"])
@@ -997,19 +1098,23 @@ def attendance_report():
 
     <form method="post">
         <label>From Date</label><br>
-        <input type="date" name="from_date" value="{{ start }}" required><br>
+        <input type="date" name="from_date"
+               value="{{ start }}" required><br>
 
         <label>To Date</label><br>
-        <input type="date" name="to_date" value="{{ end }}" required><br>
+        <input type="date" name="to_date"
+               value="{{ end }}" required><br>
 
         <label>Total Working Days</label><br>
         <input type="number" min="1" name="working_days"
                value="{{ working }}" required><br>
 
-        <button>Calculate All Students</button>
+        <button type="submit">Calculate All Students</button>
     </form>
 
-    {% if error %}<p class="msg err">{{ error }}</p>{% endif %}
+    {% if error %}
+    <p class="msg err">{{ error }}</p>
+    {% endif %}
 
     {% if report %}
     <h2>Report: {{ start }} to {{ end }}</h2>
@@ -1017,6 +1122,7 @@ def attendance_report():
     <table>
     <tr>
         <th>Register No</th>
+        <th>Name</th>
         <th>Full Days</th>
         <th>Half Days</th>
         <th>Absent Days</th>
@@ -1025,6 +1131,7 @@ def attendance_report():
     {% for r in report %}
     <tr>
         <td>{{ r.student_id }}</td>
+        <td>{{ r.name }}</td>
         <td>{{ r.full }}</td>
         <td>{{ r.half }}</td>
         <td>{{ r.absent }}</td>
@@ -1035,16 +1142,22 @@ def attendance_report():
     {% endif %}
 
     <p>Full day = 1; half day = 0.5.</p>
-    <p>Percentage = (Full Days + Half Days × 0.5)
-       ÷ Total Working Days × 100.</p>
+    <p>
+        Percentage = (Full Days + Half Days × 0.5)
+        ÷ Total Working Days × 100.
+    </p>
 
     <a class="btn" href="/admin">Back to Dashboard</a>
     """
 
     return page(
-        "Attendance Percentage Report", body,
-        report=report, error=error,
-        start=start, end=end, working=working
+        "Attendance Percentage Report",
+        body,
+        report=report,
+        error=error,
+        start=start,
+        end=end,
+        working=working
     )
 
 
@@ -1059,8 +1172,10 @@ def monthly_redirect():
     return redirect(url_for("admin_login"))
 
 
-# Initialize database and import CSV student records.
-# Existing attendance rows are retained.
+# --------------------------------------------------
+# START APPLICATION
+# --------------------------------------------------
+
 init_db()
 import_students()
 
