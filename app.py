@@ -24,8 +24,9 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 CSV_FILE = "students.csv"
 QR_TOKEN = os.environ.get("QR_TOKEN", "SMARTQR2026")
 
-COLLEGE_LAT = float(os.environ.get("COLLEGE_LAT", "11.067294"))
-COLLEGE_LON = float(os.environ.get("COLLEGE_LON", "77.083478"))
+# Keep your correct college coordinates in Render Environment.
+COLLEGE_LAT = float(os.environ.get("COLLEGE_LAT", "11.0679090"))
+COLLEGE_LON = float(os.environ.get("COLLEGE_LON", "77.0833440"))
 ALLOWED_RADIUS = 100
 
 MORNING_START = os.environ.get("MORNING_START", "09:00")
@@ -46,9 +47,56 @@ if not DATABASE_URL:
     )
 
 
+# --------------------------------------------------
+# INDIA TIME HELPERS
+# --------------------------------------------------
+
 def now_ist():
     return datetime.now(IST)
 
+
+def today_ist():
+    return now_ist().date().isoformat()
+
+
+def time_ist():
+    return now_ist().strftime("%I:%M:%S %p")
+
+
+def active_session():
+    current = now_ist().strftime("%H:%M")
+
+    if MORNING_START <= current <= MORNING_END:
+        return "morning"
+
+    if AFTERNOON_START <= current <= AFTERNOON_END:
+        return "afternoon"
+
+    return None
+
+
+def session_closed(session_name, selected_date):
+    """Only show Absent after that session's attendance window closes."""
+    today = now_ist().date()
+    selected = date.fromisoformat(selected_date)
+
+    if selected < today:
+        return True
+
+    if selected > today:
+        return False
+
+    current = now_ist().strftime("%H:%M")
+
+    if session_name == "morning":
+        return current > MORNING_END
+
+    return current > AFTERNOON_END
+
+
+# --------------------------------------------------
+# DATABASE
+# --------------------------------------------------
 
 def db():
     return psycopg2.connect(
@@ -56,10 +104,6 @@ def db():
         cursor_factory=RealDictCursor
     )
 
-
-# --------------------------------------------------
-# DATABASE SETUP - PRESERVE EXISTING RECORDS
-# --------------------------------------------------
 
 def init_db():
     conn = db()
@@ -113,6 +157,7 @@ def init_db():
                 ADD COLUMN IF NOT EXISTS reason TEXT
             """)
 
+            # Preserve existing historical attendance records.
             cur.execute("""
                 UPDATE attendance
                 SET session_name = 'legacy_full'
@@ -131,14 +176,7 @@ def init_db():
                 WHERE marked_by IS NULL OR marked_by = ''
             """)
 
-            cur.execute("""
-                DROP INDEX IF EXISTS idx_attendance_student_date
-            """)
-
-            cur.execute("""
-                DROP INDEX IF EXISTS idx_attendance_device_date
-            """)
-
+            # Separate morning and afternoon entries.
             cur.execute("""
                 CREATE UNIQUE INDEX IF NOT EXISTS
                 uq_attendance_student_session
@@ -206,7 +244,7 @@ def import_students():
 
 
 # --------------------------------------------------
-# COLLEGE LOCATION VERIFICATION
+# LOCATION AND QR VALIDATION
 # --------------------------------------------------
 
 def inside_college(latitude, longitude):
@@ -217,6 +255,7 @@ def inside_college(latitude, longitude):
         return False
 
     radius = 6371000
+
     lat1 = math.radians(COLLEGE_LAT)
     lat2 = math.radians(latitude)
     dlat = math.radians(latitude - COLLEGE_LAT)
@@ -243,34 +282,6 @@ def qr_required():
     )
 
 
-# --------------------------------------------------
-# ATTENDANCE SESSION - ALWAYS USE INDIA TIME
-# --------------------------------------------------
-
-def active_session():
-    now = now_ist().strftime("%H:%M")
-
-    if MORNING_START <= now <= MORNING_END:
-        return "morning"
-
-    if AFTERNOON_START <= now <= AFTERNOON_END:
-        return "afternoon"
-
-    return None
-
-
-def current_date():
-    return now_ist().date().isoformat()
-
-
-def current_time():
-    return now_ist().strftime("%I:%M:%S %p")
-
-
-# --------------------------------------------------
-# ADMIN AUTHENTICATION
-# --------------------------------------------------
-
 def admin_required(function):
     @wraps(function)
     def wrapper(*args, **kwargs):
@@ -281,7 +292,7 @@ def admin_required(function):
 
 
 # --------------------------------------------------
-# COMMON HTML LAYOUT
+# COMMON HTML AND COLOURS
 # --------------------------------------------------
 
 BASE = """
@@ -291,23 +302,23 @@ BASE = """
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{ title }}</title>
 <style>
+* { box-sizing: border-box; }
 body {
     font-family: Arial, sans-serif;
     background: #f3f5f8;
     margin: 0;
-    padding: 20px;
+    padding: 16px;
     color: #222;
 }
 .card {
-    max-width: 1100px;
-    margin: 20px auto;
+    max-width: 1200px;
+    margin: 16px auto;
     background: white;
     padding: 24px;
     border-radius: 14px;
     box-shadow: 0 3px 14px #0001;
 }
 input, select, button {
-    box-sizing: border-box;
     padding: 11px;
     margin: 6px 0;
     max-width: 100%;
@@ -327,55 +338,70 @@ button, .btn {
     cursor: pointer;
     display: inline-block;
 }
-.submit-btn {
-    background: #176b38;
-    width: 100%;
-    margin-top: 12px;
-    font-weight: bold;
-    padding: 14px;
-}
 table {
     border-collapse: collapse;
     width: 100%;
     background: white;
-    margin-top: 15px;
+    margin: 14px 0 22px;
 }
 th, td {
     border: 1px solid #ddd;
     padding: 10px;
     text-align: left;
 }
-th {
-    background: #222;
-    color: white;
-}
-.msg {
-    padding: 12px;
-    background: #eef6ee;
-    border-radius: 7px;
-    margin: 12px 0;
-}
-.err {
-    background: #ffe8e8;
-    color: #9b111e;
-}
+th { background: #222; color: white; }
 .nav {
     display: flex;
     gap: 8px;
     flex-wrap: wrap;
     margin: 15px 0;
 }
-label {
-    display: inline-block;
-    margin-top: 8px;
+.msg {
+    padding: 13px;
+    background: #e8f7ed;
+    color: #176b35;
+    border-radius: 7px;
+    margin: 12px 0;
+    font-weight: bold;
 }
-@media(max-width:650px) {
-    body { padding: 8px; }
-    .card {
-        padding: 13px;
-        margin: 8px auto;
-        overflow-x: auto;
-    }
+.err {
+    background: #ffe8e8;
+    color: #a71919;
+}
+.present {
+    color: #16803d;
+    font-weight: bold;
+    white-space: nowrap;
+}
+.absent {
+    color: #c62828;
+    font-weight: bold;
+    white-space: nowrap;
+}
+.half {
+    color: #b56b00;
+    font-weight: bold;
+}
+.pending {
+    color: #777;
+    font-weight: bold;
+}
+.success-card {
+    max-width: 650px;
+    text-align: center;
+    margin: 40px auto;
+    border: 1px solid #b8e5c5;
+    background: #f0fff4;
+    padding: 28px;
+    border-radius: 14px;
+}
+.success-icon {
+    color: #16803d;
+    font-size: 54px;
+}
+@media(max-width:700px) {
+    body { padding: 7px; }
+    .card { padding: 13px; margin: 7px auto; }
     table { font-size: 12px; }
     th, td { padding: 7px; }
 }
@@ -393,8 +419,16 @@ def page(title, body, **context):
     return render_template_string(BASE, title=title, body=rendered)
 
 
+def status_html(present, closed):
+    if present:
+        return '<span class="present">✓ Present</span>'
+    if closed:
+        return '<span class="absent">✕ Absent</span>'
+    return '<span class="pending">— Pending</span>'
+
+
 # --------------------------------------------------
-# HOME
+# HOME PAGE
 # --------------------------------------------------
 
 @app.route("/")
@@ -405,8 +439,7 @@ def home():
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT student_id, name
-                FROM students
-                ORDER BY student_id
+                FROM students ORDER BY student_id
             """)
             students = cur.fetchall()
     finally:
@@ -425,14 +458,10 @@ def home():
     <table>
     <tr><th>Register Number</th><th>Name</th></tr>
     {% for s in students %}
-    <tr>
-        <td>{{ s.student_id }}</td>
-        <td>{{ s.name }}</td>
-    </tr>
+    <tr><td>{{ s.student_id }}</td><td>{{ s.name }}</td></tr>
     {% endfor %}
     </table>
     """
-
     return page("Smart QR Attendance", body, students=students)
 
 
@@ -445,8 +474,7 @@ def qr_access(token):
     if token != QR_TOKEN:
         return page(
             "Invalid QR",
-            "<h1>Invalid QR Code</h1>"
-            "<p>This QR code is not valid.</p>"
+            "<h1>Invalid QR Code</h1><p>This QR code is not valid.</p>"
         )
 
     session.pop("qr_verified", None)
@@ -493,7 +521,6 @@ def qr_access(token):
     }
     </script>
     """
-
     return page("Verify Location", body)
 
 
@@ -501,9 +528,7 @@ def qr_access(token):
 def verify_location():
     data = request.get_json(silent=True) or {}
 
-    if inside_college(
-        data.get("latitude"), data.get("longitude")
-    ):
+    if inside_college(data.get("latitude"), data.get("longitude")):
         session["location_verified"] = True
         session["qr_verified"] = True
         return jsonify(success=True)
@@ -518,7 +543,7 @@ def verify_location():
 
 
 # --------------------------------------------------
-# STUDENT ATTENDANCE - VISIBLE SUBMIT BUTTON
+# STUDENT ATTENDANCE
 # --------------------------------------------------
 
 @app.route("/scan", methods=["GET", "POST"])
@@ -527,53 +552,43 @@ def scan():
         return page(
             "Access Denied",
             "<h1>🔒 Access Denied</h1>"
-            "<p>Scan the official QR and verify your college location first.</p>"
+            "<p>Scan the official QR and verify your location first.</p>"
         )
 
     message = ""
-    success = False
+    error = ""
 
     if request.method == "POST":
         sid = (request.form.get("student_id") or "").strip()
         device = (request.form.get("device_id") or "").strip()
+        sess = active_session()
 
         if not sid:
-            message = "Please enter your register number."
-
-        elif len(device) < 20:
-            message = (
-                "Device verification is not ready. "
-                "Refresh the page and try again."
+            error = "Enter your register number."
+        elif not sess:
+            error = (
+                "Attendance time is closed. Morning: "
+                f"{MORNING_START}-{MORNING_END}; Afternoon: "
+                f"{AFTERNOON_START}-{AFTERNOON_END}."
             )
-
+        elif len(device) < 20:
+            error = "Device verification failed. Refresh and try again."
         else:
-            sess = active_session()
-
             conn = db()
 
             try:
                 with conn.cursor() as cur:
                     cur.execute("""
                         SELECT student_id, name
-                        FROM students
-                        WHERE student_id = %s
+                        FROM students WHERE student_id = %s
                     """, (sid,))
                     student = cur.fetchone()
 
                     if not student:
-                        message = "Register number not found."
-
-                    elif not sess:
-                        message = (
-                            "Attendance time is closed. "
-                            f"Morning: {MORNING_START}-{MORNING_END}; "
-                            f"Afternoon: {AFTERNOON_START}-{AFTERNOON_END}. "
-                            "Please check the allowed time and try again."
-                        )
-
+                        error = "Register number not found."
                     else:
-                        today = current_date()
-                        now = current_time()
+                        today = today_ist()
+                        now = time_ist()
 
                         cur.execute("""
                             SELECT id FROM attendance
@@ -583,11 +598,9 @@ def scan():
                         """, (sid, today, sess))
 
                         if cur.fetchone():
-                            message = (
-                                "This student has already marked "
-                                "attendance for this session."
+                            error = (
+                                "Attendance already marked for this session."
                             )
-
                         else:
                             cur.execute("""
                                 SELECT student_id FROM attendance
@@ -598,11 +611,10 @@ def scan():
                             """, (device, today, sess))
 
                             if cur.fetchone():
-                                message = (
+                                error = (
                                     "This device has already been used "
                                     "for this session."
                                 )
-
                             else:
                                 cur.execute("""
                                     INSERT INTO attendance
@@ -613,138 +625,85 @@ def scan():
                                     sid, today, now, device,
                                     sess, "Present", "QR"
                                 ))
-
                                 conn.commit()
-                                success = True
+
+                                success_body = """
+                                <div class="success-card">
+                                    <div class="success-icon">✓</div>
+                                    <h1 class="present">
+                                        Attendance Marked Successfully!
+                                    </h1>
+                                    <p>Your attendance has been recorded.</p>
+                                    <hr>
+                                    <p><b>Name:</b> {{ name }}</p>
+                                    <p><b>Register Number:</b> {{ sid }}</p>
+                                    <p><b>Date:</b> {{ today }}</p>
+                                    <p><b>Time:</b> {{ now }}</p>
+                                    <p><b>Session:</b> {{ sess.title() }}</p>
+                                    <a class="btn" href="/">Home</a>
+                                </div>
+                                """
+                                return page(
+                                    "Attendance Successful",
+                                    success_body,
+                                    name=student["name"],
+                                    sid=sid,
+                                    today=today,
+                                    now=now,
+                                    sess=sess
+                                )
 
             except psycopg2.errors.UniqueViolation:
                 conn.rollback()
-                message = (
-                    "Attendance already exists for this student, "
-                    "device, or session."
-                )
-
-            except Exception:
-                conn.rollback()
-                app.logger.exception("Student attendance submission failed")
-                message = (
-                    "Unable to submit attendance right now. "
-                    "Please try again or contact the admin."
-                )
+                error = "Attendance already exists for this session."
 
             finally:
                 conn.close()
 
-            if success:
-                body = """
-                <h1>✅ Attendance Submitted Successfully</h1>
-                <p>Name: <b>{{ name }}</b></p>
-                <p>Register Number: <b>{{ sid }}</b></p>
-                <p>Date: <b>{{ today }}</b></p>
-                <p>Time: <b>{{ now }}</b></p>
-                <p>Session: <b>{{ sess }}</b></p>
-                <p>Your attendance has been saved.</p>
-                <a class="btn" href="/">Home</a>
-                """
-                return page(
-                    "Attendance Submitted",
-                    body,
-                    name=student["name"],
-                    sid=sid,
-                    today=today,
-                    now=now,
-                    sess=sess.title()
-                )
-
     body = """
     <h1>📱 Student Attendance</h1>
-    <p>Enter your register number and press Submit Attendance.</p>
 
     {% if message %}
-    <p class="msg err">{{ message }}</p>
+    <p class="msg">{{ message }}</p>
+    {% endif %}
+    {% if error %}
+    <p class="msg err">{{ error }}</p>
     {% endif %}
 
     <p><b>Morning:</b> {{ ms }}–{{ me }}</p>
     <p><b>Afternoon:</b> {{ astart }}–{{ aend }}</p>
 
-    <form method="post" id="attendanceForm">
-        <label for="student_id">Register Number</label><br>
-        <input
-            id="student_id"
-            name="student_id"
-            required
-            autocomplete="off"
-            placeholder="Enter your register number"
-            style="width:100%;"
-        >
-
+    <form method="post">
+        <label>Register Number</label><br>
+        <input name="student_id" required autocomplete="off"><br>
         <input type="hidden" name="device_id" id="device_id">
-
-        <button class="submit-btn" type="submit" id="submitBtn">
-            Submit Attendance
-        </button>
+        <button type="submit">Submit Attendance</button>
     </form>
 
-    <p id="deviceMsg"></p>
-    <a class="btn" href="/">Home</a>
-
     <script>
-    (function () {
-        const key = "smartqr_device_token";
-        let token = "";
+    const key = "smartqr_device_token";
+    let token = localStorage.getItem(key);
 
-        try {
-            token = localStorage.getItem(key) || "";
+    if (!token) {
+        token = (crypto.randomUUID)
+            ? crypto.randomUUID()
+            : "dev-" + Date.now() + "-" +
+              Math.random().toString(36).slice(2) +
+              Math.random().toString(36).slice(2);
+        localStorage.setItem(key, token);
+    }
 
-            if (!token || token.length < 20) {
-                token = (
-                    (window.crypto && crypto.randomUUID)
-                    ? crypto.randomUUID() + crypto.randomUUID()
-                    : "device-" + Date.now() + "-" +
-                      Math.random().toString(36).slice(2) +
-                      Math.random().toString(36).slice(2) +
-                      Math.random().toString(36).slice(2)
-                );
-
-                localStorage.setItem(key, token);
-            }
-
-            document.getElementById("device_id").value = token;
-        } catch (e) {
-            document.getElementById("deviceMsg").textContent =
-                "Device setup failed. Please refresh and try again.";
-            document.getElementById("submitBtn").disabled = true;
-        }
-
-        document.getElementById("attendanceForm").addEventListener(
-            "submit", function (event) {
-                const reg = document.getElementById("student_id").value.trim();
-                const device = document.getElementById("device_id").value;
-
-                if (!reg) {
-                    event.preventDefault();
-                    alert("Please enter your register number.");
-                    return;
-                }
-
-                if (!device || device.length < 20) {
-                    event.preventDefault();
-                    alert("Device verification is not ready. Refresh the page.");
-                }
-            }
-        );
-    })();
+    document.getElementById("device_id").value = token;
     </script>
+
+    <a class="btn" href="/">Home</a>
     """
 
     return page(
-        "Student Attendance",
-        body,
-        message=message,
-        ms=MORNING_START,
-        me=MORNING_END,
-        astart=AFTERNOON_START,
-        aend=AFTERNOON_END
+        "Student Attendance", body,
+        message=message, error=error,
+        ms=MORNING_START, me=MORNING_END,
+        astart=AFTERNOON_START, aend=AFTERNOON_END
     )
 
 
@@ -780,7 +739,6 @@ def admin_login():
     </form>
     <a class="btn" href="/">Home</a>
     """
-
     return page("Admin Login", body, error=error)
 
 
@@ -797,6 +755,13 @@ def admin_logout():
 @app.route("/admin")
 @admin_required
 def admin_dashboard():
+    selected_date = request.args.get("date") or today_ist()
+
+    try:
+        date.fromisoformat(selected_date)
+    except ValueError:
+        selected_date = today_ist()
+
     conn = db()
 
     try:
@@ -805,26 +770,86 @@ def admin_dashboard():
             total = cur.fetchone()["n"]
 
             cur.execute("""
+                SELECT student_id, name, parent_phone
+                FROM students ORDER BY student_id
+            """)
+            students = cur.fetchall()
+
+            cur.execute("""
                 SELECT a.student_id,
                        COALESCE(s.name, 'Unknown') AS name,
                        a.date, a.time, a.session_name, a.status,
                        a.marked_by, a.reason
                 FROM attendance a
-                LEFT JOIN students s
-                  ON s.student_id = a.student_id
+                LEFT JOIN students s ON s.student_id = a.student_id
                 ORDER BY a.date DESC, a.time DESC
                 LIMIT 300
             """)
             records = cur.fetchall()
 
             cur.execute("""
-                SELECT student_id, name, parent_phone
-                FROM students ORDER BY student_id
-            """)
-            students = cur.fetchall()
+                SELECT student_id, session_name, status
+                FROM attendance
+                WHERE date = %s
+            """, (selected_date,))
+            day_records = cur.fetchall()
 
     finally:
         conn.close()
+
+    # Build each student's morning/afternoon status for selected date.
+    by_student = {}
+
+    for row in day_records:
+        sid = row["student_id"]
+        by_student.setdefault(sid, set())
+
+        if row["status"] == "Present":
+            kind = row["session_name"]
+
+            if kind == "legacy_full":
+                by_student[sid].update(["morning", "afternoon"])
+            elif kind in ("morning", "afternoon"):
+                by_student[sid].add(kind)
+
+    morning_closed = session_closed("morning", selected_date)
+    afternoon_closed = session_closed("afternoon", selected_date)
+
+    daily_rows = []
+
+    for student in students:
+        sid = student["student_id"]
+        present_sessions = by_student.get(sid, set())
+
+        morning_present = "morning" in present_sessions
+        afternoon_present = "afternoon" in present_sessions
+
+        morning_html = status_html(morning_present, morning_closed)
+        afternoon_html = status_html(
+            afternoon_present, afternoon_closed
+        )
+
+        if morning_present and afternoon_present:
+            final_status = (
+                '<span class="present">✓ Full Day Present</span>'
+            )
+        elif morning_closed and afternoon_closed:
+            if morning_present or afternoon_present:
+                final_status = (
+                    '<span class="half">◐ Half Day Present</span>'
+                )
+            else:
+                final_status = '<span class="absent">✕ Absent</span>'
+        else:
+            final_status = '<span class="pending">In Progress</span>'
+
+        daily_rows.append({
+            "student_id": sid,
+            "name": student["name"],
+            "morning_html": morning_html,
+            "afternoon_html": afternoon_html,
+            "final_status": final_status
+        })
 
     body = """
     <h1>Admin Dashboard</h1>
@@ -837,9 +862,43 @@ def admin_dashboard():
         <a class="btn" href="/admin/logout">Logout</a>
     </div>
 
+    <h2>Daily Attendance Status</h2>
+    <form method="get">
+        <label>Select Date</label><br>
+        <input type="date" name="date" value="{{ selected_date }}" required>
+        <button type="submit">View Attendance</button>
+    </form>
+
+    <table>
+    <tr>
+        <th>Register No</th>
+        <th>Student Name</th>
+        <th>Morning</th>
+        <th>Afternoon</th>
+        <th>Final Status</th>
+    </tr>
+    {% for r in daily_rows %}
+    <tr>
+        <td>{{ r.student_id }}</td>
+        <td>{{ r.name }}</td>
+        <td>{{ r.morning_html|safe }}</td>
+        <td>{{ r.afternoon_html|safe }}</td>
+        <td>{{ r.final_status|safe }}</td>
+    </tr>
+    {% endfor %}
+    </table>
+
+    <p>
+        <span class="present">✓ Present</span> &nbsp;
+        <span class="absent">✕ Absent</span> &nbsp;
+        <span class="pending">— Pending</span>
+    </p>
+
     <h2>Student Database</h2>
     <table>
-    <tr><th>Register No</th><th>Name</th><th>Parent Phone</th></tr>
+    <tr>
+        <th>Register No</th><th>Name</th><th>Parent Phone</th>
+    </tr>
     {% for s in students %}
     <tr>
         <td>{{ s.student_id }}</td>
@@ -862,7 +921,13 @@ def admin_dashboard():
         <td>{{ r.date }}</td>
         <td>{{ r.time }}</td>
         <td>{{ r.session_name }}</td>
-        <td>{{ r.status }}</td>
+        <td>
+        {% if r.status == 'Present' %}
+            <span class="present">✓ Present</span>
+        {% else %}
+            <span class="absent">✕ {{ r.status }}</span>
+        {% endif %}
+        </td>
         <td>{{ r.marked_by }}</td>
         <td>{{ r.reason or '—' }}</td>
     </tr>
@@ -871,12 +936,13 @@ def admin_dashboard():
     """
 
     return page(
-        "Admin Dashboard",
-        body,
+        "Admin Dashboard", body,
         user=session["admin_user"],
         total=total,
+        students=students,
         records=records,
-        students=students
+        daily_rows=daily_rows,
+        selected_date=selected_date
     )
 
 
@@ -897,7 +963,6 @@ def manual_attendance():
 
         if sess not in ("morning", "afternoon") or not reason:
             error = "Select a session and enter a reason."
-
         else:
             conn = db()
 
@@ -910,10 +975,9 @@ def manual_attendance():
 
                     if not student:
                         error = "Student register number not found."
-
                     else:
-                        today = current_date()
-                        now = current_time()
+                        today = today_ist()
+                        now = time_ist()
 
                         cur.execute("""
                             SELECT id FROM attendance
@@ -923,8 +987,9 @@ def manual_attendance():
                         """, (sid, today, sess))
 
                         if cur.fetchone():
-                            error = "Attendance already exists for this session."
-
+                            error = (
+                                "Attendance already exists for this session."
+                            )
                         else:
                             cur.execute("""
                                 INSERT INTO attendance
@@ -976,13 +1041,7 @@ def manual_attendance():
 
     <a class="btn" href="/admin">Back to Dashboard</a>
     """
-
-    return page(
-        "Manual Attendance",
-        body,
-        message=message,
-        error=error
-    )
+    return page("Manual Attendance", body, message=message, error=error)
 
 
 # --------------------------------------------------
@@ -1009,7 +1068,7 @@ def attendance_report():
             working_days = int(working)
 
             if date_to < date_from:
-                raise ValueError("To Date must be on or after From Date.")
+                raise ValueError("Invalid date range.")
 
             if working_days <= 0:
                 raise ValueError("Working days must be greater than zero.")
@@ -1098,12 +1157,10 @@ def attendance_report():
 
     <form method="post">
         <label>From Date</label><br>
-        <input type="date" name="from_date"
-               value="{{ start }}" required><br>
+        <input type="date" name="from_date" value="{{ start }}" required><br>
 
         <label>To Date</label><br>
-        <input type="date" name="to_date"
-               value="{{ end }}" required><br>
+        <input type="date" name="to_date" value="{{ end }}" required><br>
 
         <label>Total Working Days</label><br>
         <input type="number" min="1" name="working_days"
@@ -1112,9 +1169,7 @@ def attendance_report():
         <button type="submit">Calculate All Students</button>
     </form>
 
-    {% if error %}
-    <p class="msg err">{{ error }}</p>
-    {% endif %}
+    {% if error %}<p class="msg err">{{ error }}</p>{% endif %}
 
     {% if report %}
     <h2>Report: {{ start }} to {{ end }}</h2>
@@ -1122,7 +1177,7 @@ def attendance_report():
     <table>
     <tr>
         <th>Register No</th>
-        <th>Name</th>
+        <th>Student Name</th>
         <th>Full Days</th>
         <th>Half Days</th>
         <th>Absent Days</th>
@@ -1151,13 +1206,9 @@ def attendance_report():
     """
 
     return page(
-        "Attendance Percentage Report",
-        body,
-        report=report,
-        error=error,
-        start=start,
-        end=end,
-        working=working
+        "Attendance Percentage Report", body,
+        report=report, error=error,
+        start=start, end=end, working=working
     )
 
 
@@ -1173,7 +1224,7 @@ def monthly_redirect():
 
 
 # --------------------------------------------------
-# START APPLICATION
+# STARTUP
 # --------------------------------------------------
 
 init_db()
