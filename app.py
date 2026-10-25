@@ -27,7 +27,7 @@ QR_TOKEN = os.environ.get("QR_TOKEN", "SMARTQR2026")
 # Keep your correct college coordinates in Render Environment.
 COLLEGE_LAT = float(os.environ.get("COLLEGE_LAT", "11.0679090"))
 COLLEGE_LON = float(os.environ.get("COLLEGE_LON", "77.0833440"))
-ALLOWED_RADIUS = 100
+ALLOWED_RADIUS = 500
 
 MORNING_START = os.environ.get("MORNING_START", "09:00")
 MORNING_END = os.environ.get("MORNING_END", "09:30")
