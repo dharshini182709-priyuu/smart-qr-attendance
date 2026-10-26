@@ -27,7 +27,7 @@ QR_TOKEN = os.environ.get("QR_TOKEN", "SMARTQR2026")
 # Keep your correct college coordinates in Render Environment.
 COLLEGE_LAT = float(os.environ.get("COLLEGE_LAT", "11.0679090"))
 COLLEGE_LON = float(os.environ.get("COLLEGE_LON", "77.0833440"))
-ALLOWED_RADIUS = 500
+ALLOWED_RADIUS = 100
 
 MORNING_START = os.environ.get("MORNING_START", "09:00")
 MORNING_END = os.environ.get("MORNING_END", "09:30")
@@ -452,6 +452,9 @@ def home():
     <div class="nav">
         <a class="btn" href="/admin/login">Admin Login</a>
         <a class="btn" href="/scan">Student Attendance</a>
+        <a class="btn" href="/student/percentage">
+    Check Attendance Percentage
+</a>
     </div>
 
     <h2>Student List</h2>
@@ -1211,6 +1214,225 @@ def attendance_report():
         start=start, end=end, working=working
     )
 
+
+# --------------------------------------------------
+# STUDENT ATTENDANCE PERCENTAGE CHECK
+# --------------------------------------------------
+
+@app.route("/student/percentage", methods=["GET", "POST"])
+def student_percentage():
+    report = None
+    error = ""
+    student_id = ""
+    start = ""
+    end = ""
+    working = ""
+
+    if request.method == "POST":
+        student_id = (
+            request.form.get("student_id") or ""
+        ).strip()
+        start = request.form.get("from_date", "")
+        end = request.form.get("to_date", "")
+        working = request.form.get("working_days", "")
+
+        try:
+            date_from = date.fromisoformat(start)
+            date_to = date.fromisoformat(end)
+            working_days = int(working)
+
+            if not student_id:
+                raise ValueError("Enter your register number.")
+
+            if date_to < date_from:
+                raise ValueError("To date must be after From date.")
+
+            if working_days <= 0:
+                raise ValueError("Working days must be greater than zero.")
+
+            conn = db()
+
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT student_id, name
+                        FROM students
+                        WHERE student_id = %s
+                    """, (student_id,))
+
+                    student = cur.fetchone()
+
+                    if not student:
+                        error = "Register number not found."
+                    else:
+                        cur.execute("""
+                            SELECT date, session_name, status
+                            FROM attendance
+                            WHERE student_id = %s
+                              AND date >= %s
+                              AND date <= %s
+                        """, (student_id, start, end))
+
+                        rows = cur.fetchall()
+
+                        morning_dates = set()
+                        afternoon_dates = set()
+                        legacy_dates = set()
+
+                        for row in rows:
+                            if row["status"] != "Present":
+                                continue
+
+                            day = str(row["date"])
+                            session_name = row["session_name"]
+
+                            if session_name == "legacy_full":
+                                legacy_dates.add(day)
+                            elif session_name == "morning":
+                                morning_dates.add(day)
+                            elif session_name == "afternoon":
+                                afternoon_dates.add(day)
+
+                        full_dates = (
+                            legacy_dates
+                            | (morning_dates & afternoon_dates)
+                        )
+
+                        half_dates = (
+                            morning_dates ^ afternoon_dates
+                        ) - full_dates
+
+                        full_days = len(full_dates)
+                        half_days = len(half_dates)
+
+                        absent_days = max(
+                            0,
+                            working_days - full_days - half_days
+                        )
+
+                        percentage = round(
+                            (
+                                full_days + half_days * 0.5
+                            ) / working_days * 100,
+                            2
+                        )
+
+                        if percentage < 75:
+                            category = "Low Attendance Alert"
+                            advice = (
+                                "Your attendance is below 75%. "
+                                "Please improve your attendance."
+                            )
+                            colour = "#b91c1c"
+                            bg = "#fee2e2"
+
+                        elif percentage < 80:
+                            category = "Attendance Warning"
+                            advice = (
+                                "Your attendance is between 75% and "
+                                "80%. Improve it to reach 80% or above."
+                            )
+                            colour = "#b45309"
+                            bg = "#fef3c7"
+
+                        else:
+                            category = "Good Attendance"
+                            advice = (
+                                "Good! Your attendance is 80% or above. "
+                                "Keep maintaining your attendance."
+                            )
+                            colour = "#166534"
+                            bg = "#dcfce7"
+
+                        report = {
+                            "student_id": student["student_id"],
+                            "name": student["name"],
+                            "full_days": full_days,
+                            "half_days": half_days,
+                            "absent_days": absent_days,
+                            "percentage": percentage,
+                            "category": category,
+                            "advice": advice,
+                            "colour": colour,
+                            "bg": bg
+                        }
+
+            finally:
+                conn.close()
+
+        except (ValueError, TypeError):
+            error = (
+                "Please enter a valid register number, "
+                "date range and working days."
+            )
+
+    body = """
+    <h1>Student Attendance Percentage</h1>
+    <p>Enter your details to check your attendance percentage.</p>
+
+    <form method="post">
+        <label>Register Number</label><br>
+        <input name="student_id"
+               value="{{ student_id }}" required><br>
+
+        <label>From Date</label><br>
+        <input type="date" name="from_date"
+               value="{{ start }}" required><br>
+
+        <label>To Date</label><br>
+        <input type="date" name="to_date"
+               value="{{ end }}" required><br>
+
+        <label>Total Working Days</label><br>
+        <input type="number" name="working_days"
+               min="1" value="{{ working }}" required><br>
+
+        <button type="submit">Check Percentage</button>
+    </form>
+
+    {% if error %}
+        <p class="msg err">{{ error }}</p>
+    {% endif %}
+
+    {% if report %}
+        <hr>
+        <h2>{{ report.name }}</h2>
+        <p>Register Number: <b>{{ report.student_id }}</b></p>
+
+        <table>
+            <tr><th>Attendance Details</th><th>Count</th></tr>
+            <tr><td>Full Days</td><td>{{ report.full_days }}</td></tr>
+            <tr><td>Half Days</td><td>{{ report.half_days }}</td></tr>
+            <tr><td>Absent Days</td><td>{{ report.absent_days }}</td></tr>
+        </table>
+
+        <div style="padding:18px; border-radius:10px;
+                    background:{{ report.bg }};
+                    color:{{ report.colour }};">
+            <h2>{{ report.percentage }}%</h2>
+            <h3>{{ report.category }}</h3>
+            <p>{{ report.advice }}</p>
+        </div>
+    {% endif %}
+
+    <p>
+      Formula: (Full Days + Half Days × 0.5)
+      ÷ Total Working Days × 100
+    </p>
+
+    <a class="btn" href="/">Home</a>
+    """
+
+    return page(
+        "Student Attendance Percentage",
+        body,
+        report=report,
+        error=error,
+        student_id=student_id,
+        start=start,
+        end=end,
+        working=working
+    )
 
 @app.route("/attendance")
 @admin_required
